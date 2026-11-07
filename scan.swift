@@ -25,6 +25,9 @@ struct Options {
     var verbose = false
     var raw = false             // skip straighten/clean-up
     var keepBlank = false
+    var long = false            // long printouts: scan up to the feeder's max length
+    var split = true            // split long scans into pages
+    var pageLength = 11.0       // inches per printout page
 }
 
 let usage = """
@@ -47,6 +50,10 @@ options:
   -d, --duplex        scan both sides, if supported
       --raw           keep pages as scanned: no straightening, cropping or clean-up
       --keep-blank    keep blank pages (skipped by default)
+  -l, --long          long printout (fanfold, dot matrix): scans up to 72", trims
+                      the unused tail, splits into pages, removes greenbar stripes
+      --page-length IN  page length for --long splitting (default 11)
+      --no-split      with --long, keep the printout as one tall page
       --open          open the result when done
   -v, --verbose       log scanner events
   -h, --help          show this help
@@ -60,6 +67,10 @@ examples:
   scan -b receipts.pdf         feed sheets one by one into receipts.pdf
   scan -m gray -r 200 note.jpg one grayscale page as JPEG
   scan clean old.pdf           straighten an old scan into old-clean.pdf
+  scan -l -b printout.pdf      fanfold printout, up to 6 pages per stretch
+
+long printouts: tear off the tractor-hole strips first (max width 8.5"),
+feed at most 72" (6 pages) at a time and guide the paper in and out by hand.
 
 Pages are straightened, cropped to the sheet, turned upright, and cleaned up
 (white paper, darker text) unless you pass --raw.
@@ -96,6 +107,9 @@ func parseArgs() -> Options {
         case "--open": o.open = true
         case "--raw": o.raw = true
         case "--keep-blank": o.keepBlank = true
+        case "-l", "--long": o.long = true
+        case "--no-split": o.split = false
+        case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l
         case "-v", "--verbose": o.verbose = true
         case "info", "scan", "clean": o.command = a
         default:
@@ -220,7 +234,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
         case "bw": fu.pixelDataType = .BW; fu.bitDepth = .depth1Bit
         default: fu.pixelDataType = .RGB; fu.bitDepth = .depth8Bits
         }
-        if let f = fu as? ICScannerFunctionalUnitDocumentFeeder {
+        if let f = fu as? ICScannerFunctionalUnitDocumentFeeder, !opts.long {
             if let t = docType(opts.size), f.supportedDocumentTypes.contains(Int(t.rawValue)) {
                 f.documentType = t
             } else if opts.size != "default" {
@@ -230,8 +244,14 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
                 if f.supportsDuplexScanning { f.duplexScanningEnabled = true } else { log("note: duplex not supported") }
             }
         }
-        let (w, h) = pageInches(opts.size)
-        fu.scanArea = NSRect(x: 0, y: 0, width: w, height: h)
+        if opts.long {
+            // No document type covers fanfold, so ask for the feeder's full width and length.
+            fu.scanArea = NSRect(x: 0, y: 0, width: min(8.5, fu.physicalSize.width), height: fu.physicalSize.height)
+            if opts.duplex, let f = fu as? ICScannerFunctionalUnitDocumentFeeder, f.supportsDuplexScanning { f.duplexScanningEnabled = true }
+        } else {
+            let (w, h) = pageInches(opts.size)
+            fu.scanArea = NSRect(x: 0, y: 0, width: w, height: h)
+        }
         v("dpi \(fu.resolution) area \(fu.scanArea) docType \((fu as? ICScannerFunctionalUnitDocumentFeeder)?.documentType.rawValue ?? 0)")
         s.transferMode = .fileBased
         s.downloadsDirectory = tmpDir
@@ -412,6 +432,70 @@ struct PageProcessor {
         return img.transformed(by: t).composited(over: white).cropped(to: img.extent)
     }
 
+    /// Printout clean-up: the brightest channel turns green/blue bar stripes white while
+    /// black ribbon ink stays dark, then a curve whitens paper and darkens faint ink.
+    func cleanPrintout(_ img: CIImage) -> CIImage {
+        img.applyingFilter("CIMaximumComponent").applyingFilter("CIToneCurve", parameters: [
+            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 0.4, y: 0.12),
+            "inputPoint2": CIVector(x: 0.6, y: 0.4), "inputPoint3": CIVector(x: 0.82, y: 1),
+            "inputPoint4": CIVector(x: 1, y: 1),
+        ])
+    }
+
+    /// Long printouts: trims what was scanned past the paper's end, then cuts pages every
+    /// `pageInches`, nudging each cut to the emptiest band nearby (the gap at the perforation).
+    func splitLong(_ input: CIImage, dpi: Int, pageInches: Double, split: Bool) -> [CIImage] {
+        let img = cleanUp ? cleanPrintout(input) : input
+        let k = min(1, 600 / img.extent.width)
+        let small = normalized(img.transformed(by: CGAffineTransform(scaleX: k, y: k)))
+        let w = Int(small.extent.width), h = Int(small.extent.height)
+        guard w > 50, h > 50 else { return [img] }
+        var px = [UInt8](repeating: 0, count: w * h)
+        context.render(small, toBitmap: &px, rowBytes: w, bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                       format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
+        // Per row (top to bottom): dark scanner background, and how much ink.
+        let x0 = w * 3 / 100, x1 = w - x0
+        var background = [Bool](repeating: false, count: h), ink = [Int](repeating: 0, count: h)
+        for y in 0..<h {
+            var sum = 0, dark = 0
+            for x in x0..<x1 { let p = Int(px[y * w + x]); sum += p; if p < 128 { dark += 1 } }
+            background[y] = Double(sum) / Double(x1 - x0) < 90
+            ink[y] = background[y] ? 0 : dark
+        }
+        let rpi = Double(dpi) * k                      // rows per inch in the small copy
+        let inkRow = { (y: Int) in Double(ink[y]) > Double(x1 - x0) * 0.003 }
+        guard let lastInk = (0..<h).last(where: inkRow) else { return [] }
+        var end = min(h, lastInk + Int(0.3 * rpi))
+        // A dark run after the content is the scanner past the paper's end.
+        let run = max(1, Int(0.2 * rpi))
+        if let paperEnd = (Int(rpi)..<h).first(where: { y in (y..<min(h, y + run)).allSatisfy { background[$0] } }) {
+            end = min(end, paperEnd)
+        }
+        var cuts = [0]
+        if split {
+            let pl = Int(pageInches * rpi), win = Int(0.4 * rpi), band = max(1, Int(0.08 * rpi))
+            var next = pl
+            while next < end - Int(0.5 * rpi) {
+                var best = next, bestScore = Int.max
+                for c in max(cuts.last! + pl / 2, next - win)...min(end - 1, next + win) {
+                    let score = (c..<min(h, c + band)).reduce(0) { $0 + ink[$1] } * 1000 + abs(c - next)
+                    if score < bestScore { best = c; bestScore = score }
+                }
+                cuts.append(best)
+                next = best + pl
+            }
+        }
+        cuts.append(end)
+        v(String(format: "printout is %.1f\" long, %d page%@", Double(end) / rpi, cuts.count - 1, cuts.count == 2 ? "" : "s"))
+        // Bitmap rows run top down; Core Image's y runs bottom up.
+        let H = img.extent.height
+        return zip(cuts, cuts.dropFirst()).map { top, bottom in
+            let y0 = H - CGFloat(bottom) / k, y1 = H - CGFloat(top) / k
+            return normalized(img.cropped(to: CGRect(x: img.extent.minX, y: img.extent.minY + y0,
+                                                     width: img.extent.width, height: y1 - y0)))
+        }
+    }
+
     /// White paper, darker text: Core Image's document filter, then a levels stretch.
     func enhance(_ img: CIImage) -> CIImage {
         var out = img
@@ -488,7 +572,7 @@ func writeOutput(pages: [URL], to url: URL, format: String, dpi: Int) throws -> 
 // MARK: - Main
 
 var opts = parseArgs()
-let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw")
+let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw" && !opts.raw)
 
 /// Cleans a page file in place. Returns false when the page is blank.
 func cleanPage(_ url: URL) -> Bool {
@@ -500,6 +584,21 @@ func cleanPage(_ url: URL) -> Bool {
         catch { log("note: could not clean page: \(error.localizedDescription)") }
         return true
     }
+}
+
+/// Splits a long printout scan into page files next to it. Returns them in order.
+func splitLongPage(_ url: URL) -> [URL] {
+    guard let img = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return [url] }
+    let parts = processor.splitLong(img, dpi: opts.dpi, pageInches: opts.pageLength, split: opts.split)
+    let png = url.pathExtension.lowercased() == "png"
+    var out: [URL] = []
+    for (i, part) in parts.enumerated() {
+        let dest = url.deletingPathExtension().appendingPathExtension("p\(i + 1).\(url.pathExtension)")
+        do { try processor.write(part, to: dest, png: png); out.append(dest) }
+        catch { log("note: could not write page: \(error.localizedDescription)") }
+    }
+    try? FileManager.default.removeItem(at: url)
+    return out
 }
 
 /// `scan clean INPUT [OUTPUT]`: run the clean-up on an existing PDF or image.
@@ -534,7 +633,11 @@ func runClean() -> Never {
         // Keep the image's own dpi so PDF pages come out at the right physical size.
         if let src = CGImageSourceCreateWithURL(input as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-           let dpi = props[kCGImagePropertyDPIWidth] as? Double, dpi > 0 { opts.dpi = Int(dpi) }
+           let width = props[kCGImagePropertyPixelWidth] as? Double {
+            let dpi = props[kCGImagePropertyDPIWidth] as? Double ?? 72
+            // 72 is the generic default; if that would make the page wider than 14", assume 8.5" wide.
+            opts.dpi = dpi == 72 && width / 72 > 14 ? Int(width / 8.5) : Int(dpi)
+        }
         let url = tmp.appendingPathComponent("page-1.\(ext)")
         try? FileManager.default.copyItem(at: input, to: url)
         pages.append(url)
@@ -542,6 +645,7 @@ func runClean() -> Never {
 
     var kept: [URL] = []
     for (i, p) in pages.enumerated() {
+        if opts.long { kept += splitLongPage(p); continue }
         if cleanPage(p) || opts.keepBlank { kept.append(p) } else { log("page \(i + 1) is blank, skipped") }
     }
     guard !kept.isEmpty else { die("every page was blank") }
@@ -597,7 +701,12 @@ scanner.start { dev in
     }
 
     scanner.configure(dev)
-    if opts.batch {
+    if opts.long {
+        log("""
+        long printout: tear off the tractor-hole strips, feed top edge first, face up
+          up to 72" (6 pages) per stretch; guide the paper in and out by hand\(opts.batch ? "\n  after each stretch, feed the next one or press Enter to finish" : "")
+        """)
+    } else if opts.batch {
         log("""
         batch scan: feed page 1 first, then 2, 3… (saved in the order fed)
           face up, top edge first, against the left side of the slot
@@ -606,13 +715,18 @@ scanner.start { dev in
     }
     var n = 0
     func loop() {
-        let prompt = !opts.batch ? "insert the sheet face up, top edge first…"
+        let prompt = opts.long ? (n == 0 ? "insert the printout, top edge first…" : "insert the next stretch, or press Enter to finish…")
+            : !opts.batch ? "insert the sheet face up, top edge first…"
             : n == 0 ? "insert page 1…"
             : "insert page \(n + 1), or press Enter to finish…"
         scanner.scanOne(dev, prompt: prompt) { got in
             if got {
                 n += 1
-                if !opts.raw, let page = scanner.pages.last, !cleanPage(page), !opts.keepBlank {
+                if opts.long, let strip = scanner.pages.popLast() {
+                    let parts = splitLongPage(strip)
+                    scanner.pages += parts
+                    log("stretch \(n) done: \(parts.count) page\(parts.count == 1 ? "" : "s"), \(scanner.pages.count) so far")
+                } else if !opts.raw, let page = scanner.pages.last, !cleanPage(page), !opts.keepBlank {
                     scanner.pages.removeLast()
                     log("page \(n) is blank, skipped")
                 } else {
