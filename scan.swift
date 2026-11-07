@@ -521,18 +521,29 @@ struct PageProcessor {
         }
     }
 
-    /// White paper, darker text: Core Image's document filter, then a levels stretch.
+    /// White paper, darker text, faint ink kept: divides each channel by the local paper colour
+    /// (a morphological closing erases the ink), so tinted or uneven paper goes white while faint
+    /// dot-matrix or carbon-copy text keeps its contrast, then a curve darkens anything clearly
+    /// darker than the paper. Colour ink (red boxes, blue signatures) stays coloured.
     func enhance(_ img: CIImage) -> CIImage {
-        var out = img
-        if let f = CIFilter(name: "CIDocumentEnhancer") {
-            f.setValue(img, forKey: kCIInputImageKey)
-            f.setValue(1.0, forKey: "inputAmount")
-            out = f.outputImage ?? img
-        }
-        // Lift light-grey paper to white without touching mid tones (keeps colour logos).
-        return out.applyingFilter("CIToneCurve", parameters: [
-            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 0.25, y: 0.22),
-            "inputPoint2": CIVector(x: 0.5, y: 0.5), "inputPoint3": CIVector(x: 0.86, y: 1),
+        let r = max(3, img.extent.width / 250)          // ~10 px at 300 dpi on letter width
+        let paper = img.clampedToExtent()
+            .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: r])
+            .applyingFilter("CIMorphologyMinimum", parameters: [kCIInputRadiusKey: r])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: r * 2])
+            // Solid dark areas wider than the closing would pass as "paper" and turn white;
+            // never treat anything darker than 70% as paper.
+            .applyingFilter("CIMaximumCompositing", parameters: [
+                kCIInputBackgroundImageKey: CIImage(color: CIColor(red: 0.7, green: 0.7, blue: 0.7))])
+            .cropped(to: img.extent)
+        let flat = paper.applyingFilter("CIDivideBlendMode", parameters: [kCIInputBackgroundImageKey: img])
+        // A slight blur joins dot-matrix dots into strokes before the curve.
+        let soft = flat.clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: r / 10])
+            .cropped(to: img.extent)
+        return soft.applyingFilter("CIToneCurve", parameters: [
+            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 0.62, y: 0.03),
+            "inputPoint2": CIVector(x: 0.77, y: 0.3), "inputPoint3": CIVector(x: 0.92, y: 1),
             "inputPoint4": CIVector(x: 1, y: 1),
         ])
     }
