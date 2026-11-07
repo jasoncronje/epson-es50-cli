@@ -69,4 +69,4 @@ remove. After removal, scan only works through the patched SANE build.
 ## License
 
 MIT, except `sane/epsonds-long-paper.patch`, which is GPL-2.0-or-later like the SANE code it
-changes. See `LICENSE`.
+changes (see `sane/LICENSE`). See `LICENSE`.

@@ -1,0 +1,6 @@
+epsonds-long-paper.patch modifies SANE's epsonds backend (backend/epsonds-cmd.c) and is
+licensed under the GNU General Public License, version 2 or later, with the SANE exception:
+the same terms as the SANE code it changes. See https://gitlab.com/sane-project/backends
+(COPYING and LICENSE there).
+
+build.sh and remove-epson.sh are under the MIT license in ../LICENSE.
