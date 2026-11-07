@@ -43,6 +43,10 @@ options:
   -v, --verbose       log scanner events
   -h, --help          show this help
 
+feeding (ES-50): one sheet at a time, face up, top edge first, against the
+left side of the slot. In a batch, start with page 1: pages are saved in the
+order you feed them.
+
 examples:
   scan                         one page to a PDF in ~/Documents/Scans
   scan -b receipts.pdf         feed sheets one by one into receipts.pdf
@@ -347,10 +351,18 @@ scanner.start { dev in
     }
 
     scanner.configure(dev)
+    if opts.batch {
+        log("""
+        batch scan: feed page 1 first, then 2, 3… (saved in the order fed)
+          face up, top edge first, against the left side of the slot
+          press Enter after the last page
+        """)
+    }
     var n = 0
     func loop() {
-        let prompt = n == 0 ? "insert a sheet into the scanner…"
-            : "insert the next sheet, or press Enter to finish…"
+        let prompt = !opts.batch ? "insert the sheet face up, top edge first…"
+            : n == 0 ? "insert page 1…"
+            : "insert page \(n + 1), or press Enter to finish…"
         scanner.scanOne(dev, prompt: prompt) { got in
             if got {
                 n += 1
