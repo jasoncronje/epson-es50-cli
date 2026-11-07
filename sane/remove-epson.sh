@@ -41,7 +41,7 @@ $USER_HOME/Library/Preferences/com.epson.EventManager.plist
 PKGS="$(pkgutil --pkgs | grep -i '^com\.epson\.' || true)"
 
 echo "files and folders:"
-echo "$PATHS" | while IFS= read -r p; do [ -n "$p" ] && [ -e "$p" ] && echo "  $p"; done
+echo "$PATHS" | while IFS= read -r p; do if [ -n "$p" ] && [ -e "$p" ]; then echo "  $p"; fi; done
 echo "installer receipts:"
 for p in $PKGS; do echo "  $p"; done
 
@@ -53,13 +53,13 @@ fi
 
 # Stop the background agents and any running Epson processes.
 for plist in /Library/LaunchAgents/com.epson.*.plist; do
-    [ -e "$plist" ] && launchctl bootout "gui/$USER_ID" "$plist" 2>/dev/null || true
+    if [ -e "$plist" ]; then launchctl bootout "gui/$USER_ID" "$plist" 2>/dev/null || true; fi
 done
 pkill -f "EPSON Scanner 2" 2>/dev/null || true
 pkill -f "/Applications/Epson Software/" 2>/dev/null || true
 
 echo "$PATHS" | while IFS= read -r p; do
-    [ -n "$p" ] && [ -e "$p" ] && rm -rf "$p" && echo "removed $p"
+    if [ -n "$p" ] && [ -e "$p" ]; then rm -rf "$p" && echo "removed $p"; fi
 done
 for p in $PKGS; do pkgutil --forget "$p" >/dev/null && echo "forgot $p"; done
 # Image Capture caches its device list; restart it so the old driver is gone.
