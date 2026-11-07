@@ -511,7 +511,10 @@ struct PageProcessor {
             "inputTopLeft": pt(quad.topLeft), "inputTopRight": pt(quad.topRight),
             "inputBottomLeft": pt(quad.bottomLeft), "inputBottomRight": pt(quad.bottomRight),
         ])
-        return normalized(out)
+        // Shave a sliver off each side: the outline sits on the paper's edge, where it blends
+        // into the backing and would leave a coloured or dark fringe.
+        let inset = out.extent.width * 0.004
+        return normalized(out.cropped(to: out.extent.insetBy(dx: inset, dy: inset)))
     }
 
     func quadArea(_ q: VNRectangleObservation) -> CGFloat {

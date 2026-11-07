@@ -1,7 +1,13 @@
-# scan
+# epson-es50-cli
 
-Small macOS CLI for the Epson ES-50 sheet-fed scanner: scans to PDF/JPEG/PNG, straightens,
-crops and cleans pages, and scans long documents up to 72" (dot-matrix printouts, contracts).
+`scan`: a macOS command-line tool for the Epson ES-50 sheet-fed scanner, with no Epson software
+needed. It scans to PDF/JPEG/PNG; straightens, crops and cleans pages (white paper, crisp text,
+faint ink kept); cuts small receipts and slips out of the scanner background; and scans long
+documents up to 72" (dot-matrix printouts, contracts) through a patched SANE driver.
+
+![A tilted yellow receipt on dark scanner backing, and the same receipt cropped, straightened and cleaned](docs/before-after.png)
+
+*Sample receipt made up for this picture: raw scan on the left, `scan`'s output on the right.*
 
 Tested only on the Epson ES-50. Other Epson scanners that SANE's `epsonds` backend supports
 (ES and DS series) may work, but are untested.
