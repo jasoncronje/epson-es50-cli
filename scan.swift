@@ -3,13 +3,16 @@
 
 import AppKit
 import Foundation
+import CoreImage
 import ImageCaptureCore
 import PDFKit
+import Vision
 
 // MARK: - Options
 
 struct Options {
     var command = "scan"
+    var input: String?          // for `scan clean`
     var output: String?
     var dpi = 300
     var mode = "color"          // color | gray | bw
@@ -20,17 +23,20 @@ struct Options {
     var waitSeconds = 30.0      // how long to wait for a sheet
     var open = false
     var verbose = false
+    var raw = false             // skip straighten/clean-up
+    var keepBlank = false
 }
 
 let usage = """
 usage: scan [options] [output]
-       scan info            show scanner capabilities
+       scan info                  show scanner capabilities
+       scan clean INPUT [OUTPUT]  straighten and clean an existing PDF or image
 
 Scans sheets from the attached USB scanner. Insert a sheet and run, or run
 first: it waits for paper.
 
 options:
-  -o, --output PATH   output file (default: ~/Documents/Scans/scan-<time>.pdf)
+  -o, --output PATH   output file (default: ./scan-<time>.pdf in the current folder)
   -r, --dpi N         resolution (default 300)
   -m, --mode MODE     color | gray | bw (default color)
   -f, --format FMT    pdf | jpg | png (default: output extension, else pdf)
@@ -39,6 +45,8 @@ options:
                       to finish, or it finishes when no sheet arrives in --wait
   -w, --wait SECS     how long to wait for each sheet (default 30)
   -d, --duplex        scan both sides, if supported
+      --raw           keep pages as scanned: no straightening, cropping or clean-up
+      --keep-blank    keep blank pages (skipped by default)
       --open          open the result when done
   -v, --verbose       log scanner events
   -h, --help          show this help
@@ -48,9 +56,13 @@ left side of the slot. In a batch, start with page 1: pages are saved in the
 order you feed them.
 
 examples:
-  scan                         one page to a PDF in ~/Documents/Scans
+  scan                         one page to a PDF in the current folder
   scan -b receipts.pdf         feed sheets one by one into receipts.pdf
   scan -m gray -r 200 note.jpg one grayscale page as JPEG
+  scan clean old.pdf           straighten an old scan into old-clean.pdf
+
+Pages are straightened, cropped to the sheet, turned upright, and cleaned up
+(white paper, darker text) unless you pass --raw.
 """
 
 func die(_ msg: String, code: Int32 = 1) -> Never {
@@ -82,13 +94,16 @@ func parseArgs() -> Options {
         case "-b", "--batch": o.batch = true
         case "-d", "--duplex": o.duplex = true
         case "--open": o.open = true
+        case "--raw": o.raw = true
+        case "--keep-blank": o.keepBlank = true
         case "-v", "--verbose": o.verbose = true
-        case "info", "scan": o.command = a
+        case "info", "scan", "clean": o.command = a
         default:
             if a.hasPrefix("-") { die("unknown option \(a)\n\n\(usage)") }
-            o.output = a
+            if o.command == "clean" && o.input == nil { o.input = a } else { o.output = a }
         }
     }
+    if o.command == "clean" && o.input == nil { die("clean needs an input file") }
     guard ["color", "gray", "grey", "bw"].contains(o.mode) else { die("--mode must be color, gray or bw") }
     if o.mode == "grey" { o.mode = "gray" }
     return o
@@ -101,7 +116,7 @@ func resolveOutput(_ o: inout Options) -> URL {
     if let out = o.output {
         url = URL(fileURLWithPath: (out as NSString).expandingTildeInPath)
     } else {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/Scans")
+        let dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
                                                 formatOptions: [.withFullDate, .withTime, .withDashSeparatorInDate])
         url = dir.appendingPathComponent("scan-\(stamp).\(o.format ?? "pdf")")
@@ -275,6 +290,171 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
     }
 }
 
+// MARK: - Page clean-up
+
+/// Straightens, crops, turns upright and cleans a scanned page with Vision and Core Image.
+struct PageProcessor {
+    let context = CIContext()
+    let verbose: Bool
+    let cleanUp: Bool           // false for 1-bit scans
+
+    enum Result { case page(CIImage), blank }
+
+    func v(_ s: String) { if verbose { log("· " + s) } }
+
+    func process(_ input: CIImage) -> Result {
+        var img = cropToSheet(input)
+        let (lineCount, flipped) = readOrientation(img)
+        if flipped {
+            v("page is upside down, rotating")
+            img = normalized(img.oriented(.down))
+        }
+        img = deskew(img)
+        if cleanUp { img = enhance(img) }
+        if lineCount == 0 && isBlank(img) { return .blank }
+        return .page(img)
+    }
+
+    func normalized(_ img: CIImage) -> CIImage {
+        img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+    }
+
+    /// Finds the sheet's four corners and warps it to a flat rectangle.
+    func cropToSheet(_ img: CIImage) -> CIImage {
+        let req = VNDetectDocumentSegmentationRequest()
+        try? VNImageRequestHandler(ciImage: img).perform([req])
+        guard let quad = req.results?.first, quad.confidence > 0.5 else { v("no sheet outline found"); return img }
+        let area = quadArea(quad)
+        // Skip when the outline is tiny (likely a mis-detection) or already the whole image.
+        guard area > 0.4, area < 0.97 else { v(String(format: "sheet covers %.0f%%, not cropping", area * 100)); return img }
+        let w = img.extent.width, h = img.extent.height
+        // Paper is rectangular: a skewed outline means the edge was misread (common on white
+        // backgrounds), and warping to it would shear the page.
+        let corners = [quad.topLeft, quad.topRight, quad.bottomRight, quad.bottomLeft].map { CGPoint(x: $0.x * w, y: $0.y * h) }
+        let worst = (0..<4).map { i -> Double in
+            let a = corners[(i + 3) % 4], b = corners[i], c = corners[(i + 1) % 4]
+            let u = (Double(a.x - b.x), Double(a.y - b.y)), v = (Double(c.x - b.x), Double(c.y - b.y))
+            let cosang = (u.0 * v.0 + u.1 * v.1) / (hypot(u.0, u.1) * hypot(v.0, v.1))
+            return abs(acos(max(-1, min(1, cosang))) * 180 / .pi - 90)
+        }.max() ?? 90
+        guard worst < 1.5 else { v(String(format: "sheet outline not rectangular (%.1f° off), not cropping", worst)); return img }
+        func pt(_ p: CGPoint) -> CIVector { CIVector(x: p.x * w + img.extent.minX, y: p.y * h + img.extent.minY) }
+        v(String(format: "cropping to sheet (%.0f%% of scan)", area * 100))
+        let out = img.applyingFilter("CIPerspectiveCorrection", parameters: [
+            "inputTopLeft": pt(quad.topLeft), "inputTopRight": pt(quad.topRight),
+            "inputBottomLeft": pt(quad.bottomLeft), "inputBottomRight": pt(quad.bottomRight),
+        ])
+        return normalized(out)
+    }
+
+    func quadArea(_ q: VNRectangleObservation) -> CGFloat {
+        let p = [q.topLeft, q.topRight, q.bottomRight, q.bottomLeft]
+        var a: CGFloat = 0
+        for i in 0..<4 { let j = (i + 1) % 4; a += p[i].x * p[j].y - p[j].x * p[i].y }
+        return abs(a) / 2
+    }
+
+    /// Reads text on a small copy. Accurate recognition reads upside-down text too, and
+    /// reports those lines running right to left, which is how a flipped page shows up.
+    func readOrientation(_ img: CIImage) -> (lines: Int, flipped: Bool) {
+        let k = min(1, 1000 / img.extent.width)
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        try? VNImageRequestHandler(ciImage: img.transformed(by: CGAffineTransform(scaleX: k, y: k))).perform([req])
+        let lines = req.results ?? []
+        let backwards = lines.filter { $0.topRight.x < $0.topLeft.x }.count
+        v("\(lines.count) text lines, \(backwards) reading upside down")
+        return (lines.count, lines.count >= 3 && Double(backwards) > Double(lines.count) * 0.6)
+    }
+
+    /// Levels the page by projection profile: the angle at which dark pixels fall into the
+    /// fewest, fullest rows is the angle of the text lines and table rules.
+    func deskew(_ img: CIImage) -> CIImage {
+        let k = min(1, 800 / img.extent.width)
+        let small = img.transformed(by: CGAffineTransform(scaleX: k, y: k))
+        let w = Int(small.extent.width), h = Int(small.extent.height)
+        guard w > 50, h > 50 else { return img }
+        var px = [UInt8](repeating: 0, count: w * h)
+        context.render(normalized(small), toBitmap: &px, rowBytes: w, bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                       format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
+        // Dark pixels, skipping a 3% margin where sheet edges and scanner shadow live.
+        let mx = w * 3 / 100, my = h * 3 / 100
+        var xs: [Double] = [], ys: [Double] = []
+        for y in my..<(h - my) { for x in mx..<(w - mx) where px[y * w + x] < 140 { xs.append(Double(x)); ys.append(Double(y)) } }
+        guard xs.count > 200 else { return img }
+        func score(_ deg: Double) -> Double {
+            let t = deg * .pi / 180, c = cos(t), s = sin(t)
+            var bins = [Double](repeating: 0, count: h * 2)
+            for i in 0..<xs.count {
+                let r = Int(ys[i] * c - xs[i] * s) + h / 2
+                if r >= 0 && r < bins.count { bins[r] += 1 }
+            }
+            return bins.reduce(0) { $0 + $1 * $1 }
+        }
+        var best = 0.0, bestScore = score(0)
+        for step in stride(from: -50, through: 50, by: 2) where step != 0 {
+            let d = Double(step) / 10, sc = score(d)
+            if sc > bestScore { best = d; bestScore = sc }
+        }
+        for step in stride(from: -10, through: 10, by: 1) {
+            let d = best + Double(step) / 50, sc = score(d)
+            if sc > bestScore { best = d; bestScore = sc }
+        }
+        // Bitmap rows run top to bottom, so the skew in Core Image's y-up space is -best.
+        let skew = -best
+        guard abs(skew) >= 0.1 else { return img }
+        v(String(format: "straightening by %.2f°", -skew))
+        let angle = -skew * .pi / 180
+        let c = CGPoint(x: img.extent.midX, y: img.extent.midY)
+        let t = CGAffineTransform(translationX: c.x, y: c.y).rotated(by: angle).translatedBy(x: -c.x, y: -c.y)
+        // Fill the corners exposed by the rotation with white, keep the original frame.
+        let white = CIImage(color: .white).cropped(to: img.extent)
+        return img.transformed(by: t).composited(over: white).cropped(to: img.extent)
+    }
+
+    /// White paper, darker text: Core Image's document filter, then a levels stretch.
+    func enhance(_ img: CIImage) -> CIImage {
+        var out = img
+        if let f = CIFilter(name: "CIDocumentEnhancer") {
+            f.setValue(img, forKey: kCIInputImageKey)
+            f.setValue(1.0, forKey: "inputAmount")
+            out = f.outputImage ?? img
+        }
+        // Lift light-grey paper to white without touching mid tones (keeps colour logos).
+        return out.applyingFilter("CIToneCurve", parameters: [
+            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 0.25, y: 0.22),
+            "inputPoint2": CIVector(x: 0.5, y: 0.5), "inputPoint3": CIVector(x: 0.86, y: 1),
+            "inputPoint4": CIVector(x: 1, y: 1),
+        ])
+    }
+
+    func isBlank(_ img: CIImage) -> Bool {
+        // A blank sheet is bright and nearly uniform: check average and darkest tones on a small copy.
+        let small = img.transformed(by: CGAffineTransform(scaleX: 200 / img.extent.width, y: 200 / img.extent.width))
+        let avg = small.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: small.extent)])
+        let min = small.applyingFilter("CIAreaMinimum", parameters: [kCIInputExtentKey: CIVector(cgRect: small.extent)])
+        func lum(_ i: CIImage) -> Double {
+            var px = [UInt8](repeating: 0, count: 4)
+            context.render(i, toBitmap: &px, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                           format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+            return (0.299 * Double(px[0]) + 0.587 * Double(px[1]) + 0.114 * Double(px[2])) / 255
+        }
+        let a = lum(avg), m = lum(min)
+        v(String(format: "brightness avg %.2f, darkest %.2f", a, m))
+        return a > 0.93 && m > 0.6
+    }
+
+    func write(_ img: CIImage, to url: URL, png: Bool) throws {
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        if png {
+            try context.writePNGRepresentation(of: img, to: url, format: .RGBA8, colorSpace: cs)
+        } else {
+            try context.writeJPEGRepresentation(of: img, to: url, colorSpace: cs,
+                options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.85])
+        }
+    }
+}
+
 // MARK: - Output
 
 func writeOutput(pages: [URL], to url: URL, format: String, dpi: Int) throws -> [URL] {
@@ -308,6 +488,72 @@ func writeOutput(pages: [URL], to url: URL, format: String, dpi: Int) throws -> 
 // MARK: - Main
 
 var opts = parseArgs()
+let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw")
+
+/// Cleans a page file in place. Returns false when the page is blank.
+func cleanPage(_ url: URL) -> Bool {
+    guard let img = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]) else { return true }
+    switch processor.process(img) {
+    case .blank: return false
+    case .page(let out):
+        do { try processor.write(out, to: url, png: url.pathExtension.lowercased() == "png") }
+        catch { log("note: could not clean page: \(error.localizedDescription)") }
+        return true
+    }
+}
+
+/// `scan clean INPUT [OUTPUT]`: run the clean-up on an existing PDF or image.
+func runClean() -> Never {
+    let input = URL(fileURLWithPath: (opts.input! as NSString).expandingTildeInPath)
+    guard FileManager.default.fileExists(atPath: input.path) else { die("no such file: \(input.path)") }
+    if opts.output == nil {
+        let ext = input.pathExtension.isEmpty ? "pdf" : input.pathExtension
+        opts.output = input.deletingPathExtension().path + "-clean." + ext
+    }
+    let out = resolveOutput(&opts)
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("scan-clean-\(ProcessInfo.processInfo.processIdentifier)")
+    try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let ext = opts.format == "png" ? "png" : "jpg"
+    var pages: [URL] = []
+
+    if input.pathExtension.lowercased() == "pdf" {
+        guard let doc = PDFDocument(url: input) else { die("could not read \(input.path)") }
+        for i in 0..<doc.pageCount {
+            guard let page = doc.page(at: i) else { continue }
+            let box = page.bounds(for: .mediaBox)
+            let scale = CGFloat(opts.dpi) / 72
+            let size = NSSize(width: box.width * scale, height: box.height * scale)
+            guard let cg = page.thumbnail(of: size, for: .mediaBox).cgImage(forProposedRect: nil, context: nil, hints: nil)
+            else { continue }
+            let url = tmp.appendingPathComponent("page-\(i + 1).\(ext)")
+            do { try processor.write(CIImage(cgImage: cg), to: url, png: ext == "png") } catch { die(error.localizedDescription) }
+            pages.append(url)
+        }
+    } else {
+        // Keep the image's own dpi so PDF pages come out at the right physical size.
+        if let src = CGImageSourceCreateWithURL(input as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let dpi = props[kCGImagePropertyDPIWidth] as? Double, dpi > 0 { opts.dpi = Int(dpi) }
+        let url = tmp.appendingPathComponent("page-1.\(ext)")
+        try? FileManager.default.copyItem(at: input, to: url)
+        pages.append(url)
+    }
+
+    var kept: [URL] = []
+    for (i, p) in pages.enumerated() {
+        if cleanPage(p) || opts.keepBlank { kept.append(p) } else { log("page \(i + 1) is blank, skipped") }
+    }
+    guard !kept.isEmpty else { die("every page was blank") }
+    do {
+        for f in try writeOutput(pages: kept, to: out, format: opts.format!, dpi: opts.dpi) { print(f.path) }
+    } catch { die(error.localizedDescription) }
+    if opts.open { NSWorkspace.shared.open(out) }
+    exit(0)
+}
+
+if opts.command == "clean" { runClean() }
+
 let outURL = opts.command == "scan" ? resolveOutput(&opts) : URL(fileURLWithPath: "/dev/null")
 let scanner = Scanner(opts: opts)
 
@@ -366,13 +612,20 @@ scanner.start { dev in
         scanner.scanOne(dev, prompt: prompt) { got in
             if got {
                 n += 1
-                log("page \(n) done")
+                if !opts.raw, let page = scanner.pages.last, !cleanPage(page), !opts.keepBlank {
+                    scanner.pages.removeLast()
+                    log("page \(n) is blank, skipped")
+                } else {
+                    log("page \(n) done")
+                }
                 if opts.batch && !scanner.stopRequested { loop(); return }
             } else if n == 0 {
                 if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
                 die("no sheet detected within \(Int(opts.waitSeconds))s")
             }
-            log("saving \(n) page\(n == 1 ? "" : "s")…")
+            let count = scanner.pages.count
+            if count == 0 { die("every page was blank, nothing saved") }
+            log("saving \(count) page\(count == 1 ? "" : "s")…")
             do {
                 let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
                 try? FileManager.default.removeItem(at: scanner.tmpDir)
