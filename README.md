@@ -1,72 +1,90 @@
 # epson-es50-cli
 
-`scan`: a macOS command-line tool for the Epson ES-50 sheet-fed scanner, with no Epson software
-needed. It scans to PDF/JPEG/PNG; straightens, crops and cleans pages (white paper, crisp text,
-faint ink kept); cuts small receipts and slips out of the scanner background; and scans long
-documents up to 72" (dot-matrix printouts, contracts) through a patched SANE driver.
+I didn't want Epson's pile of scanner software on my Mac, so I wrote `scan`: a small
+command-line tool that drives the Epson ES-50 directly. It's built to be run by AI agents and
+scripts as much as by hand.
 
 ![A tilted yellow receipt on dark scanner backing, and the same receipt cropped, straightened and cleaned](docs/before-after.png)
 
-*Sample receipt made up for this picture: raw scan on the left, `scan`'s output on the right.*
+*Made-up receipt: raw scan on the left, `scan`'s output on the right.*
 
-Tested only on the Epson ES-50. Other Epson scanners that SANE's `epsonds` backend supports
-(ES and DS series) may work, but are untested.
+## What it does
 
-## Requirements
+- Scans to PDF, JPEG or PNG
+- Crops, straightens, turns upright and cleans every page, and drops blank pages
+- Cuts small receipts and slips out of the scanner background
+- Scans long documents up to 72" (stock drivers stop at 14")
+- Needs no Epson software
 
-- macOS 12 or later (Vision document detection); tested on macOS 27
-- Xcode command-line tools (`xcode-select --install`) for `swiftc`
-- Homebrew, used by `sane/build.sh` for libusb, jpeg-turbo and SANE's source
+## Install
 
-## Setup
+Needs macOS 12+, Xcode command-line tools and Homebrew. Tested on the ES-50 only.
 
-    sane/build.sh         # builds the patched SANE driver into ~/.local/share/scan/sane
-    make install          # builds and installs to ~/.local/bin/scan
+    sane/build.sh    # builds the patched SANE driver into ~/.local/share/scan/sane
+    make install     # installs ~/.local/bin/scan
 
-## Usage
+## Commands
 
-    scan info             # show scanner capabilities
-    scan                  # one page -> ./scan-<time>.pdf in the current folder
-    scan -b bills.pdf     # feed page 1 first, face up, top edge first; Enter when done
-    scan -m gray -r 200 note.jpg
-    scan clean old.pdf    # straighten/clean an existing scan -> old-clean.pdf
-    scan -l contract.pdf  # long document (up to 72") as one tall page; --split for 11" pages
+| Command | Does |
+|---|---|
+| `scan` | Scans one sheet to `./scan-<time>.pdf` |
+| `scan file.pdf` | Scans one sheet to `file.pdf` (`.jpg` / `.png` work too) |
+| `scan -b file.pdf` | Batch: one PDF, page 1 first; Enter, Ctrl+C or `--wait` timeout finishes |
+| `scan -b -n 5 file.pdf` | Batch that stops after 5 pages |
+| `scan -l file.pdf` | Long document up to 72" as one tall page |
+| `scan -l --split file.pdf` | Long document cut into 11" pages |
+| `scan clean in.pdf [out.pdf]` | Cleans an existing PDF or image (`in-clean.pdf` by default) |
+| `scan info` | Shows the scanner and what it supports |
 
-Pages are cropped to the sheet, turned upright, straightened and cleaned up
-(white paper, darker text); blank pages are dropped. `--raw` turns this off,
-`--keep-blank` keeps blank pages.
+## Options
 
-Long printouts (`-l`): tear off the tractor-hole strips (max width 8.5"), feed up
-to 72" (6 pages) per stretch, top edge first, guiding the paper by hand. The
-unused tail is trimmed and it is saved as one tall page. `--split` (or
-`--page-length N`) cuts it into pages at the gap nearest every 11" (or N"). `--greenbar` removes green/blue bar stripes from computer printouts,
-but also fades blue or coloured ink, so use it only on greenbar paper.
+| Option | Does |
+|---|---|
+| `-s letter\|legal\|a4\|a5\|b5` | Paper size (default letter) |
+| `-m color\|gray\|bw` | Colour mode (default color) |
+| `-r 200\|300\|400\|600` | Resolution in dpi (default 300) |
+| `-w SECS` | How long to wait for paper (default 30) |
+| `--raw` | Skips the clean-up |
+| `--keep-blank` | Keeps blank pages |
+| `--faint` / `--no-faint` | Softer clean-up for dot-matrix or carbon text (default on with `-l`) |
+| `--greenbar` | Removes green-bar stripes from printouts (fades coloured ink) |
+| `--page-length IN` | With `-l`, cuts pages every IN inches |
+| `--json` | Prints a JSON result instead of file paths |
+| `--open` | Opens the result |
+| `-v` | Verbose log |
 
-Sheets smaller than the scan area (receipts, slips, tear-off forms) are cut out of the scanner
-background, straightened, and any dark backing left along the edges is painted white.
+Feed sheets face up, top edge first, against the left side of the slot.
 
-Clean-up sharpens normal pages (SANE returns the sensor image unsharpened). Faint dot-matrix or
-carbon text gets a softer recipe that joins the dots instead: on by default with `--long`, or
-force it with `--faint` / `--no-faint`.
+## For agents and scripts
 
-The ES-50 takes paper up to 72", but Image Capture and stock SANE stop at 14".
-`sane/build.sh` builds SANE's epsonds backend with `sane/epsonds-long-paper.patch`
-(it lets the scan area use the scanner's reported maximum, `#ADF AMAX`) into
-`~/.local/share/scan/sane`. When that build exists, all scans go through it and no Epson software is
-needed: `sudo sh sane/remove-epson.sh` lists Epson's scanner software and
-`--yes` removes it. Without the build, scan falls back to Image Capture, which
-needs Epson's ICA driver and stops at 14".
+- stdout has only the result: saved paths, one per line, or with `--json`:
+  `{"files":["/path/a.pdf"],"pages":3,"skipped_blank":1}`, or on failure
+  `{"error":"no sheet detected within 30s","exit":4}`
+- Progress and errors go to stderr.
+- It never prompts. With no terminal, a batch ends on `--wait`, `-n`, or SIGTERM / SIGINT,
+  which save the pages scanned so far.
 
-Run `scan --help` for all options.
+| Exit | Meaning |
+|---|---|
+| 0 | Saved |
+| 2 | Bad usage or missing input file |
+| 3 | No scanner found |
+| 4 | No paper fed within `--wait` |
+| 5 | Every page was blank |
+| 6 | Scan or file error |
+| 130 | Cancelled before anything was scanned |
 
-## Removing Epson's software (optional)
+## How long paper works
 
-`sane/remove-epson.sh` deletes Epson Scan 2, its Image Capture driver, ScanSmart, Event
-Manager and related files with sudo. It is written for the ES-50 (driver `ES017E`); check the
-list before removing anything. Run it without `--yes` first: it only prints what it would
-remove. After removal, scan only works through the patched SANE build.
+The ES-50 reports a 72" maximum (`#ADF AMAX`), but Epson's driver and stock SANE only use the
+14" area. `sane/epsonds-long-paper.patch` makes SANE's `epsonds` backend use the maximum.
+`sane/build.sh` builds that one backend from Homebrew's SANE source.
+
+## Removing Epson's software
+
+`sudo sh sane/remove-epson.sh` lists Epson's scanner apps, drivers and launch agents. Add
+`--yes` to delete them. It's written for the ES-50, so check the list first.
 
 ## License
 
-MIT, except `sane/epsonds-long-paper.patch`, which is GPL-2.0-or-later like the SANE code it
-changes (see `sane/LICENSE`). See `LICENSE`.
+MIT. The SANE patch is GPL-2.0-or-later like the code it changes (`sane/LICENSE`).

@@ -30,6 +30,8 @@ struct Options {
     var pageLength = 11.0       // inches per printout page
     var greenbar = false        // remove green/blue bar stripes (fades coloured ink)
     var faint: Bool?            // dot-matrix/carbon recipe; default on for --long
+    var maxPages: Int?          // batch: stop after this many pages
+    var json = false            // one JSON object on stdout instead of file paths
 }
 
 let usage = """
@@ -60,8 +62,16 @@ options:
                       with --long; --no-faint for crisp laser-printed pages)
       --greenbar      remove green/blue bar stripes from computer printouts (also
                       fades blue or coloured ink, so only for greenbar paper)
+  -n, --pages N       with --batch, stop after N pages
+      --json          print one JSON object on stdout (files, pages, skipped
+                      blanks; or error and exit code) instead of file paths
       --open          open the result when done
   -v, --verbose       log scanner events
+
+output: saved file paths on stdout, one per line; progress and errors on stderr.
+Ctrl+C or SIGTERM finishes and saves the pages scanned so far.
+exit codes: 0 saved, 2 bad usage, 3 no scanner, 4 no paper fed in time,
+            5 every page blank, 6 scan or file error, 130 cancelled
   -h, --help          show this help
 
 feeding (ES-50): one sheet at a time, face up, top edge first, against the
@@ -83,9 +93,30 @@ Pages are straightened, cropped to the sheet, turned upright, and cleaned up
 (white paper, darker text) unless you pass --raw.
 """
 
-func die(_ msg: String, code: Int32 = 1) -> Never {
+enum Exit {
+    static let usage: Int32 = 2, noScanner: Int32 = 3, noPaper: Int32 = 4, blank: Int32 = 5,
+               failed: Int32 = 6, cancelled: Int32 = 130
+}
+var jsonOutput = false
+
+func die(_ msg: String, code: Int32 = Exit.failed) -> Never {
     FileHandle.standardError.write(("scan: " + msg + "\n").data(using: .utf8)!)
+    if jsonOutput { printJSON(["error": msg, "exit": Int(code)]) }
     exit(code)
+}
+
+func usageError(_ msg: String) -> Never { die(msg, code: Exit.usage) }
+
+func printJSON(_ obj: [String: Any]) {
+    if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes]) {
+        print(String(decoding: d, as: UTF8.self))
+    }
+}
+
+/// Saved files go to stdout: one path per line, or a JSON summary with --json.
+func report(_ files: [URL], pages: Int, skipped: Int) {
+    if jsonOutput { printJSON(["files": files.map(\.path), "pages": pages, "skipped_blank": skipped]) }
+    else { for f in files { print(f.path) } }
 }
 
 func log(_ msg: String) {
@@ -96,7 +127,7 @@ func parseArgs() -> Options {
     var o = Options()
     var args = Array(CommandLine.arguments.dropFirst())
     func next(_ flag: String) -> String {
-        guard !args.isEmpty else { die("\(flag) needs a value") }
+        guard !args.isEmpty else { usageError("\(flag) needs a value") }
         return args.removeFirst()
     }
     while !args.isEmpty {
@@ -104,14 +135,16 @@ func parseArgs() -> Options {
         switch a {
         case "-h", "--help": print(usage); exit(0)
         case "-o", "--output": o.output = next(a)
-        case "-r", "--dpi": guard let n = Int(next(a)) else { die("bad --dpi") }; o.dpi = n
+        case "-r", "--dpi": guard let n = Int(next(a)) else { usageError("bad --dpi") }; o.dpi = n
         case "-m", "--mode": o.mode = next(a).lowercased()
         case "-f", "--format": o.format = next(a).lowercased()
         case "-s", "--size": o.size = next(a).lowercased()
-        case "-w", "--wait": guard let w = Double(next(a)) else { die("bad --wait") }; o.waitSeconds = w
+        case "-w", "--wait": guard let w = Double(next(a)) else { usageError("bad --wait") }; o.waitSeconds = w
         case "-b", "--batch": o.batch = true
         case "-d", "--duplex": o.duplex = true
         case "--open": o.open = true
+        case "--json": o.json = true
+        case "-n", "--pages": guard let n = Int(next(a)), n > 0 else { usageError("bad --pages") }; o.maxPages = n
         case "--raw": o.raw = true
         case "--keep-blank": o.keepBlank = true
         case "-l", "--long": o.long = true
@@ -120,16 +153,16 @@ func parseArgs() -> Options {
         case "--greenbar": o.greenbar = true
         case "--faint": o.faint = true
         case "--no-faint": o.faint = false
-        case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l; o.split = true
+        case "--page-length": guard let l = Double(next(a)), l > 1 else { usageError("bad --page-length") }; o.pageLength = l; o.split = true
         case "-v", "--verbose": o.verbose = true
         case "info", "scan", "clean": o.command = a
         default:
-            if a.hasPrefix("-") { die("unknown option \(a)\n\n\(usage)") }
+            if a.hasPrefix("-") { usageError("unknown option \(a)\n\n\(usage)") }
             if o.command == "clean" && o.input == nil { o.input = a } else { o.output = a }
         }
     }
-    if o.command == "clean" && o.input == nil { die("clean needs an input file") }
-    guard ["color", "gray", "grey", "bw"].contains(o.mode) else { die("--mode must be color, gray or bw") }
+    if o.command == "clean" && o.input == nil { usageError("clean needs an input file") }
+    guard ["color", "gray", "grey", "bw"].contains(o.mode) else { usageError("--mode must be color, gray or bw") }
     if o.mode == "grey" { o.mode = "gray" }
     return o
 }
@@ -150,7 +183,7 @@ func resolveOutput(_ o: inout Options) -> URL {
         let ext = url.pathExtension.lowercased()
         o.format = ext == "jpeg" ? "jpg" : (["pdf", "jpg", "png"].contains(ext) ? ext : "pdf")
     }
-    guard ["pdf", "jpg", "png"].contains(o.format!) else { die("--format must be pdf, jpg or png") }
+    guard ["pdf", "jpg", "png"].contains(o.format!) else { usageError("--format must be pdf, jpg or png") }
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     return url
 }
@@ -184,7 +217,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
             rawValue: ICDeviceTypeMask.scanner.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
         browser.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-            if self?.device == nil { die("no scanner found. Is it plugged in and switched on?") }
+            if self?.device == nil { die("no scanner found. Is it plugged in and switched on?", code: Exit.noScanner) }
         }
     }
 
@@ -237,7 +270,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
         let fu = s.selectedFunctionalUnit
         if !fu.supportedResolutions.contains(opts.dpi) {
             let options = fu.supportedResolutions.filter { [75, 100, 150, 200, 240, 300, 400, 600, 1200].contains($0) }
-            die("\(opts.dpi) dpi not supported. Try one of: \(options.map(String.init).joined(separator: ", "))")
+            usageError("\(opts.dpi) dpi not supported. Try one of: \(options.map(String.init).joined(separator: ", "))")
         }
         fu.resolution = opts.dpi
         fu.measurementUnit = .inches
@@ -796,7 +829,7 @@ func findSaneDevice(_ scanimage: URL) -> String {
     find.waitUntilExit()
     let devices = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     guard let device = devices.split(separator: "\n").first(where: { $0.hasPrefix("epsonds:") }).map(String.init) else {
-        die("no scanner found. Is it plugged in, and not in use by another app?")
+        die("no scanner found. Is it plugged in, and not in use by another app?", code: Exit.noScanner)
     }
     return device
 }
@@ -825,7 +858,7 @@ func saneArea(_ size: String) -> (Double, Double) {
 
 /// Scans through the patched SANE build: normal pages, or long paper with --long.
 func runSane(_ scanimage: URL) {
-    guard [200, 300, 400, 600].contains(opts.dpi) else { die("the scanner supports 200, 300, 400 or 600 dpi") }
+    guard [200, 300, 400, 600].contains(opts.dpi) else { usageError("the scanner supports 200, 300, 400 or 600 dpi") }
     if opts.duplex { log("note: the ES-50 scans one side only; --duplex ignored") }
     let device = findSaneDevice(scanimage)
     scanner.v("scanning via SANE on \(device)")
@@ -843,18 +876,18 @@ func runSane(_ scanimage: URL) {
         """)
     }
 
-    var n = 0
+    var n = 0, skipped = 0
     func finish() -> Never {
         let count = scanner.pages.count
         if count == 0 {
-            if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
-            die(n > 0 ? "every page was blank, nothing saved" : "nothing scanned")
+            if scanner.stopRequested { die("cancelled, nothing scanned", code: Exit.cancelled) }
+            die(n > 0 ? "every page was blank, nothing saved" : "nothing scanned", code: n > 0 ? Exit.blank : Exit.noPaper)
         }
         log("saving \(count) page\(count == 1 ? "" : "s")…")
         do {
             let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
             try? FileManager.default.removeItem(at: scanner.tmpDir)
-            for f in files { print(f.path) }
+            report(files, pages: count, skipped: skipped)
             if opts.open { NSWorkspace.shared.open(files[0]) }
             exit(0)
         } catch { die(error.localizedDescription) }
@@ -893,18 +926,20 @@ func runSane(_ scanimage: URL) {
                                        img.extent.height / CGFloat(opts.dpi), parts.count, parts.count == 1 ? "" : "s", scanner.pages.count))
                         } else if !opts.raw && !cleanPage(file) && !opts.keepBlank {
                             try? FileManager.default.removeItem(at: file)
+                            skipped += 1
                             log("page \(n) is blank, skipped")
                         } else {
                             scanner.pages.append(file)
                             log("page \(n) done")
                         }
-                        if opts.batch && !scanner.stopRequested { sheet() } else { finish() }
+                        let done = opts.maxPages.map { scanner.pages.count >= $0 } ?? false
+                        if opts.batch && !scanner.stopRequested && !done { sheet() } else { finish() }
                     } else if proc.terminationStatus == 7 {      // SANE_STATUS_NO_DOCS: no paper yet
                         if Date() < deadline && !scanner.stopRequested {
                             if !announced { log(prompt()); announced = true }
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: attempt)
                         } else if n == 0 && !scanner.stopRequested {
-                            die("no sheet detected within \(Int(opts.waitSeconds))s")
+                            die("no sheet detected within \(Int(opts.waitSeconds))s", code: Exit.noPaper)
                         } else { finish() }
                     } else {
                         let detail = msg.split(separator: "\n").last.map(String.init) ?? "exit \(proc.terminationStatus)"
@@ -925,6 +960,7 @@ func runSane(_ scanimage: URL) {
 // MARK: - Main
 
 var opts = parseArgs()
+jsonOutput = opts.json
 // Through SANE, bw scans arrive as gray and are cleaned, then thresholded; Image Capture
 // delivers 1-bit scans that skip the clean-up.
 let processor = PageProcessor(verbose: opts.verbose, cleanUp: !opts.raw && (opts.mode != "bw" || saneScanimage != nil),
@@ -961,7 +997,7 @@ func splitLongPage(_ url: URL) -> [URL] {
 /// `scan clean INPUT [OUTPUT]`: run the clean-up on an existing PDF or image.
 func runClean() -> Never {
     let input = URL(fileURLWithPath: (opts.input! as NSString).expandingTildeInPath)
-    guard FileManager.default.fileExists(atPath: input.path) else { die("no such file: \(input.path)") }
+    guard FileManager.default.fileExists(atPath: input.path) else { usageError("no such file: \(input.path)") }
     if opts.output == nil {
         let ext = input.pathExtension.isEmpty ? "pdf" : input.pathExtension
         opts.output = input.deletingPathExtension().path + "-clean." + ext
@@ -1005,14 +1041,14 @@ func runClean() -> Never {
         pages.append(url)
     }
 
-    var kept: [URL] = []
+    var kept: [URL] = [], skipped = 0
     for (i, p) in pages.enumerated() {
         if opts.long { kept += splitLongPage(p); continue }
-        if cleanPage(p) || opts.keepBlank { kept.append(p) } else { log("page \(i + 1) is blank, skipped") }
+        if cleanPage(p) || opts.keepBlank { kept.append(p) } else { skipped += 1; log("page \(i + 1) is blank, skipped") }
     }
-    guard !kept.isEmpty else { die("every page was blank") }
+    guard !kept.isEmpty else { die("every page was blank", code: Exit.blank) }
     do {
-        for f in try writeOutput(pages: kept, to: out, format: opts.format!, dpi: opts.dpi) { print(f.path) }
+        report(try writeOutput(pages: kept, to: out, format: opts.format!, dpi: opts.dpi), pages: kept.count, skipped: skipped)
     } catch { die(error.localizedDescription) }
     if opts.open { NSWorkspace.shared.open(out) }
     exit(0)
@@ -1023,15 +1059,19 @@ if opts.command == "clean" { runClean() }
 let outURL = opts.command == "scan" ? resolveOutput(&opts) : URL(fileURLWithPath: "/dev/null")
 let scanner = Scanner(opts: opts)
 
-// Ctrl+C finishes and saves pages scanned so far; a second Ctrl+C quits at once.
-signal(SIGINT, SIG_IGN)
-let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigint.setEventHandler {
-    if scanner.stopRequested { log("\ncancelled"); exit(130) }
-    log("\nfinishing…")
-    scanner.stopRequested = true
+// Ctrl+C or SIGTERM (how agents and scripts stop a batch) finishes and saves the pages
+// scanned so far; a second one quits at once.
+let stopSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler {
+        if scanner.stopRequested { die("cancelled", code: Exit.cancelled) }
+        log("\nfinishing…")
+        scanner.stopRequested = true
+    }
+    src.resume()
+    return src
 }
-sigint.resume()
 
 // Enter finishes a batch.
 if opts.batch && isatty(STDIN_FILENO) != 0 {
@@ -1082,7 +1122,7 @@ scanner.start { dev in
           press Enter after the last page
         """)
     }
-    var n = 0
+    var n = 0, skipped = 0
     func loop() {
         let prompt = opts.long ? (n == 0 ? "insert the printout, top edge first…" : "insert the next stretch, or press Enter to finish…")
             : !opts.batch ? "insert the sheet face up, top edge first…"
@@ -1097,25 +1137,27 @@ scanner.start { dev in
                     log("stretch \(n) done: \(parts.count) page\(parts.count == 1 ? "" : "s"), \(scanner.pages.count) so far")
                 } else if !opts.raw, let page = scanner.pages.last, !cleanPage(page), !opts.keepBlank {
                     scanner.pages.removeLast()
+                    skipped += 1
                     log("page \(n) is blank, skipped")
                 } else {
                     log("page \(n) done")
                 }
-                if opts.batch && !scanner.stopRequested { loop(); return }
+                let done = opts.maxPages.map { scanner.pages.count >= $0 } ?? false
+                if opts.batch && !scanner.stopRequested && !done { loop(); return }
             } else if let failure = scanner.failure {
                 if scanner.pages.isEmpty { die(failure) }
                 log("\(failure); saving the pages scanned before it")
             } else if n == 0 {
-                if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
-                die("no sheet detected within \(Int(opts.waitSeconds))s")
+                if scanner.stopRequested { die("cancelled, nothing scanned", code: Exit.cancelled) }
+                die("no sheet detected within \(Int(opts.waitSeconds))s", code: Exit.noPaper)
             }
             let count = scanner.pages.count
-            if count == 0 { die("every page was blank, nothing saved") }
+            if count == 0 { die("every page was blank, nothing saved", code: Exit.blank) }
             log("saving \(count) page\(count == 1 ? "" : "s")…")
             do {
                 let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
                 try? FileManager.default.removeItem(at: scanner.tmpDir)
-                for f in files { print(f.path) }
+                report(files, pages: count, skipped: skipped)
                 if opts.open { NSWorkspace.shared.open(files[0]) }
                 dev.requestCloseSession()
                 exit(0)
