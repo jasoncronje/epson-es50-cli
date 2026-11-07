@@ -246,7 +246,18 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
             }
         }
         if opts.long {
-            // No document type covers fanfold, so ask for the feeder's full width and length.
+            // No document type covers fanfold. The ES-50 treats paper still feeding past the
+            // document type's length as a jam (orange light), so pick the longest type the
+            // driver offers, then ask for the feeder's full width and length on top.
+            if let f = fu as? ICScannerFunctionalUnitDocumentFeeder {
+                var longest: (ICScannerDocumentType, CGFloat)?
+                for raw in f.supportedDocumentTypes {
+                    guard let t = ICScannerDocumentType(rawValue: UInt(raw)) else { continue }
+                    f.documentType = t
+                    if f.documentSize.height > (longest?.1 ?? 0) { longest = (t, f.documentSize.height) }
+                }
+                if let (t, h) = longest { f.documentType = t; v(String(format: "long mode: document type %d (%.1f\")", t.rawValue, h)) }
+            }
             fu.scanArea = NSRect(x: 0, y: 0, width: min(8.5, fu.physicalSize.width), height: fu.physicalSize.height)
             if opts.duplex, let f = fu as? ICScannerFunctionalUnitDocumentFeeder, f.supportsDuplexScanning { f.duplexScanningEnabled = true }
         } else {
