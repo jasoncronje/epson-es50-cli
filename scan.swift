@@ -26,7 +26,7 @@ struct Options {
     var raw = false             // skip straighten/clean-up
     var keepBlank = false
     var long = false            // long printouts: scan up to the feeder's max length
-    var split = true            // split long scans into pages
+    var split = false           // split long scans into pages
     var pageLength = 11.0       // inches per printout page
     var greenbar = false        // remove green/blue bar stripes (fades coloured ink)
 }
@@ -52,9 +52,9 @@ options:
       --raw           keep pages as scanned: no straightening, cropping or clean-up
       --keep-blank    keep blank pages (skipped by default)
   -l, --long          long document or printout: scans up to 72", trims the
-                      unused tail, splits into pages
-      --page-length IN  page length for --long splitting (default 11)
-      --no-split      with --long, keep the printout as one tall page
+                      unused tail, saves it as one tall page
+      --split         with --long, split into 11" pages (for paginated printouts)
+      --page-length IN  split --long scans into pages of this length
       --greenbar      remove green/blue bar stripes from computer printouts (also
                       fades blue or coloured ink, so only for greenbar paper)
       --open          open the result when done
@@ -70,7 +70,8 @@ examples:
   scan -b receipts.pdf         feed sheets one by one into receipts.pdf
   scan -m gray -r 200 note.jpg one grayscale page as JPEG
   scan clean old.pdf           straighten an old scan into old-clean.pdf
-  scan -l -b printout.pdf      fanfold printout, up to 6 pages per stretch
+  scan -l contract.pdf         long form, up to 72", as one tall page
+  scan -l --split report.pdf   long printout cut into 11" pages
 
 long printouts: tear off the tractor-hole strips first (max width 8.5"),
 feed at most 72" (6 pages) at a time and guide the paper in and out by hand.
@@ -112,8 +113,9 @@ func parseArgs() -> Options {
         case "--keep-blank": o.keepBlank = true
         case "-l", "--long": o.long = true
         case "--no-split": o.split = false
+        case "--split": o.split = true
         case "--greenbar": o.greenbar = true
-        case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l
+        case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l; o.split = true
         case "-v", "--verbose": o.verbose = true
         case "info", "scan", "clean": o.command = a
         default:
