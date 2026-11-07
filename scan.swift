@@ -29,6 +29,7 @@ struct Options {
     var split = false           // split long scans into pages
     var pageLength = 11.0       // inches per printout page
     var greenbar = false        // remove green/blue bar stripes (fades coloured ink)
+    var faint: Bool?            // dot-matrix/carbon recipe; default on for --long
 }
 
 let usage = """
@@ -55,6 +56,8 @@ options:
                       unused tail, saves it as one tall page
       --split         with --long, split into 11" pages (for paginated printouts)
       --page-length IN  split --long scans into pages of this length
+      --faint         clean-up for faint dot-matrix or carbon-copy text (default
+                      with --long; --no-faint for crisp laser-printed pages)
       --greenbar      remove green/blue bar stripes from computer printouts (also
                       fades blue or coloured ink, so only for greenbar paper)
       --open          open the result when done
@@ -115,6 +118,8 @@ func parseArgs() -> Options {
         case "--no-split": o.split = false
         case "--split": o.split = true
         case "--greenbar": o.greenbar = true
+        case "--faint": o.faint = true
+        case "--no-faint": o.faint = false
         case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l; o.split = true
         case "-v", "--verbose": o.verbose = true
         case "info", "scan", "clean": o.command = a
@@ -345,6 +350,7 @@ struct PageProcessor {
     let cleanUp: Bool           // false for 1-bit scans
     var greenbar = false        // printout stripe removal instead of the normal clean-up
     var binarize = false        // --mode bw: threshold to pure black and white at the end
+    var faint = false           // join dot-matrix dots instead of sharpening
 
     enum Result { case page(CIImage), blank }
 
@@ -528,8 +534,11 @@ struct PageProcessor {
 
     /// White paper, darker text, faint ink kept: divides each channel by the local paper colour
     /// (a morphological closing erases the ink), so tinted or uneven paper goes white while faint
-    /// dot-matrix or carbon-copy text keeps its contrast, then a curve darkens anything clearly
-    /// darker than the paper. Colour ink (red boxes, blue signatures) stays coloured.
+    /// text keeps its contrast, then a curve darkens anything clearly darker than the paper.
+    /// Colour ink (red boxes, blue signatures) stays coloured.
+    /// SANE delivers the sensor image unsharpened (Epson's driver sharpened by default), so normal
+    /// pages get an unsharp mask; faint dot-matrix pages get a slight blur instead, which joins the
+    /// dots into strokes, and a steeper curve.
     func enhance(_ img: CIImage) -> CIImage {
         let r = max(3, img.extent.width / 250)          // ~10 px at 300 dpi on letter width
         let paper = img.clampedToExtent()
@@ -542,15 +551,23 @@ struct PageProcessor {
                 kCIInputBackgroundImageKey: CIImage(color: CIColor(red: 0.7, green: 0.7, blue: 0.7))])
             .cropped(to: img.extent)
         let flat = paper.applyingFilter("CIDivideBlendMode", parameters: [kCIInputBackgroundImageKey: img])
-        // A slight blur joins dot-matrix dots into strokes before the curve.
-        let soft = flat.clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: r / 10])
+        func curve(_ i: CIImage, _ pts: [(CGFloat, CGFloat)]) -> CIImage {
+            var p: [String: Any] = [:]
+            for (n, pt) in pts.enumerated() { p["inputPoint\(n)"] = CIVector(x: pt.0, y: pt.1) }
+            return i.applyingFilter("CIToneCurve", parameters: p)
+        }
+        if faint {
+            let soft = flat.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: r / 10])
+                .cropped(to: img.extent)
+            return curve(soft, [(0, 0), (0.62, 0.03), (0.77, 0.3), (0.92, 1), (1, 1)])
+        }
+        let sharp = flat.clampedToExtent()
+            .applyingFilter("CIUnsharpMask", parameters: [kCIInputRadiusKey: r * 0.15, kCIInputIntensityKey: 0.7])
             .cropped(to: img.extent)
-        return soft.applyingFilter("CIToneCurve", parameters: [
-            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 0.62, y: 0.03),
-            "inputPoint2": CIVector(x: 0.77, y: 0.3), "inputPoint3": CIVector(x: 0.92, y: 1),
-            "inputPoint4": CIVector(x: 1, y: 1),
-        ])
+        // Gentle shoulder so anti-aliased edge pixels stay grey instead of bloating strokes;
+        // white point at 86% of paper hides the grain the sharpening brings out.
+        return curve(sharp, [(0, 0), (0.5, 0.05), (0.72, 0.45), (0.86, 1), (1, 1)])
     }
 
     func isBlank(_ img: CIImage) -> Bool {
@@ -575,7 +592,7 @@ struct PageProcessor {
             try context.writePNGRepresentation(of: img, to: url, format: .RGBA8, colorSpace: cs)
         } else {
             try context.writeJPEGRepresentation(of: img, to: url, colorSpace: cs,
-                options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.85])
+                options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.95])
         }
     }
 }
@@ -796,7 +813,8 @@ var opts = parseArgs()
 // Through SANE, bw scans arrive as gray and are cleaned, then thresholded; Image Capture
 // delivers 1-bit scans that skip the clean-up.
 let processor = PageProcessor(verbose: opts.verbose, cleanUp: !opts.raw && (opts.mode != "bw" || saneScanimage != nil),
-                              greenbar: opts.greenbar, binarize: opts.mode == "bw" && saneScanimage != nil && !opts.raw)
+                              greenbar: opts.greenbar, binarize: opts.mode == "bw" && saneScanimage != nil && !opts.raw,
+                              faint: opts.faint ?? opts.long)
 
 /// Cleans a page file in place. Returns false when the page is blank.
 func cleanPage(_ url: URL) -> Bool {

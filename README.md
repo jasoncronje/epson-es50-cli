@@ -20,6 +20,10 @@ unused tail is trimmed and it is saved as one tall page. `--split` (or
 `--page-length N`) cuts it into pages at the gap nearest every 11" (or N"). `--greenbar` removes green/blue bar stripes from computer printouts,
 but also fades blue or coloured ink, so use it only on greenbar paper.
 
+Clean-up sharpens normal pages (SANE returns the sensor image unsharpened). Faint dot-matrix or
+carbon text gets a softer recipe that joins the dots instead: on by default with `--long`, or
+force it with `--faint` / `--no-faint`.
+
 The ES-50 takes paper up to 72", but Image Capture and stock SANE stop at 14".
 `sane/build.sh` builds SANE's epsonds backend with `sane/epsonds-long-paper.patch`
 (it lets the scan area use the scanner's reported maximum, `#ADF AMAX`) into
