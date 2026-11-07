@@ -155,6 +155,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
     var onReady: ((ICScannerDevice) -> Void)?
     var scanDone: ((Error?) -> Void)?
     var stopRequested = false   // Enter or Ctrl+C: finish after the current page
+    var failure: String?        // a scan that fed paper but produced no image
 
     init(opts: Options) {
         self.opts = opts
@@ -290,12 +291,20 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
         func attempt() {
             if stopRequested { completion(false); return }
             let before = pages.count
+            let started = Date()
             v("requesting scan")
             scanDone = { [weak self] err in
                 guard let self else { return }
                 let got = self.pages.count > before
+                let took = Date().timeIntervalSince(started)
                 if got {
                     completion(true)
+                } else if took > 3 {
+                    // With no paper the driver returns at once; a slow empty result means a sheet
+                    // was fed and the scan failed partway.
+                    self.failure = String(format: "scan failed after %.0fs, driver returned no image%@", took,
+                                          err.map { ": \($0.localizedDescription) (\(($0 as NSError).code))" } ?? "")
+                    completion(false)
                 } else if !self.stopRequested && Date() < deadline {
                     if !announced { log(prompt); announced = true }
                     if let err { self.v("no page yet: \(err.localizedDescription)") }
@@ -733,6 +742,9 @@ scanner.start { dev in
                     log("page \(n) done")
                 }
                 if opts.batch && !scanner.stopRequested { loop(); return }
+            } else if let failure = scanner.failure {
+                if scanner.pages.isEmpty { die(failure) }
+                log("\(failure); saving the pages scanned before it")
             } else if n == 0 {
                 if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
                 die("no sheet detected within \(Int(opts.waitSeconds))s")
