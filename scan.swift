@@ -35,7 +35,8 @@ options:
   -m, --mode MODE     color | gray | bw (default color)
   -f, --format FMT    pdf | jpg | png (default: output extension, else pdf)
   -s, --size SIZE     a4 | letter | legal | a5 | b5 | default (default letter)
-  -b, --batch         keep scanning sheets into one PDF until no new sheet arrives
+  -b, --batch         keep scanning sheets into one PDF; press Enter (or Ctrl+C)
+                      to finish, or it finishes when no sheet arrives in --wait
   -w, --wait SECS     how long to wait for each sheet (default 30)
   -d, --duplex        scan both sides, if supported
       --open          open the result when done
@@ -120,6 +121,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
     var pages: [URL] = []
     var onReady: ((ICScannerDevice) -> Void)?
     var scanDone: ((Error?) -> Void)?
+    var stopRequested = false   // Enter or Ctrl+C: finish after the current page
 
     init(opts: Options) {
         self.opts = opts
@@ -247,6 +249,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
         let deadline = Date().addingTimeInterval(opts.waitSeconds)
         var announced = false
         func attempt() {
+            if stopRequested { completion(false); return }
             let before = pages.count
             v("requesting scan")
             scanDone = { [weak self] err in
@@ -254,7 +257,7 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
                 let got = self.pages.count > before
                 if got {
                     completion(true)
-                } else if Date() < deadline {
+                } else if !self.stopRequested && Date() < deadline {
                     if !announced { log(prompt); announced = true }
                     if let err { self.v("no page yet: \(err.localizedDescription)") }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: attempt)
@@ -304,7 +307,29 @@ var opts = parseArgs()
 let outURL = opts.command == "scan" ? resolveOutput(&opts) : URL(fileURLWithPath: "/dev/null")
 let scanner = Scanner(opts: opts)
 
-signal(SIGINT) { _ in log("\ncancelled"); exit(130) }
+// Ctrl+C finishes and saves pages scanned so far; a second Ctrl+C quits at once.
+signal(SIGINT, SIG_IGN)
+let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+sigint.setEventHandler {
+    if scanner.stopRequested { log("\ncancelled"); exit(130) }
+    log("\nfinishing…")
+    scanner.stopRequested = true
+}
+sigint.resume()
+
+// Enter finishes a batch.
+if opts.batch && isatty(STDIN_FILENO) != 0 {
+    FileHandle.standardInput.readabilityHandler = { h in
+        let data = h.availableData
+        if data.isEmpty { h.readabilityHandler = nil; return }
+        if data.contains(UInt8(ascii: "\n")) {
+            DispatchQueue.main.async {
+                if !scanner.stopRequested { log("finishing…") }
+                scanner.stopRequested = true
+            }
+        }
+    }
+}
 
 scanner.start { dev in
     if opts.command == "info" {
@@ -324,15 +349,18 @@ scanner.start { dev in
     scanner.configure(dev)
     var n = 0
     func loop() {
-        let prompt = n == 0 ? "insert a sheet into the scanner…" : "insert the next sheet (or wait \(Int(opts.waitSeconds))s to finish)…"
+        let prompt = n == 0 ? "insert a sheet into the scanner…"
+            : "insert the next sheet, or press Enter to finish…"
         scanner.scanOne(dev, prompt: prompt) { got in
             if got {
                 n += 1
                 log("page \(n) done")
-                if opts.batch { loop(); return }
+                if opts.batch && !scanner.stopRequested { loop(); return }
             } else if n == 0 {
+                if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
                 die("no sheet detected within \(Int(opts.waitSeconds))s")
             }
+            log("saving \(n) page\(n == 1 ? "" : "s")…")
             do {
                 let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
                 try? FileManager.default.removeItem(at: scanner.tmpDir)
