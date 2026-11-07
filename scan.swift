@@ -28,6 +28,7 @@ struct Options {
     var long = false            // long printouts: scan up to the feeder's max length
     var split = true            // split long scans into pages
     var pageLength = 11.0       // inches per printout page
+    var greenbar = false        // remove green/blue bar stripes (fades coloured ink)
 }
 
 let usage = """
@@ -50,10 +51,12 @@ options:
   -d, --duplex        scan both sides, if supported
       --raw           keep pages as scanned: no straightening, cropping or clean-up
       --keep-blank    keep blank pages (skipped by default)
-  -l, --long          long printout (fanfold, dot matrix): scans up to 72", trims
-                      the unused tail, splits into pages, removes greenbar stripes
+  -l, --long          long document or printout: scans up to 72", trims the
+                      unused tail, splits into pages
       --page-length IN  page length for --long splitting (default 11)
       --no-split      with --long, keep the printout as one tall page
+      --greenbar      remove green/blue bar stripes from computer printouts (also
+                      fades blue or coloured ink, so only for greenbar paper)
       --open          open the result when done
   -v, --verbose       log scanner events
   -h, --help          show this help
@@ -109,6 +112,7 @@ func parseArgs() -> Options {
         case "--keep-blank": o.keepBlank = true
         case "-l", "--long": o.long = true
         case "--no-split": o.split = false
+        case "--greenbar": o.greenbar = true
         case "--page-length": guard let l = Double(next(a)), l > 1 else { die("bad --page-length") }; o.pageLength = l
         case "-v", "--verbose": o.verbose = true
         case "info", "scan", "clean": o.command = a
@@ -337,6 +341,7 @@ struct PageProcessor {
     let context = CIContext()
     let verbose: Bool
     let cleanUp: Bool           // false for 1-bit scans
+    var greenbar = false        // printout stripe removal instead of the normal clean-up
 
     enum Result { case page(CIImage), blank }
 
@@ -465,7 +470,7 @@ struct PageProcessor {
     /// Long printouts: trims what was scanned past the paper's end, then cuts pages every
     /// `pageInches`, nudging each cut to the emptiest band nearby (the gap at the perforation).
     func splitLong(_ input: CIImage, dpi: Int, pageInches: Double, split: Bool) -> [CIImage] {
-        let img = cleanUp ? cleanPrintout(input) : input
+        let img = !cleanUp ? input : greenbar ? cleanPrintout(input) : enhance(input)
         let k = min(1, 600 / img.extent.width)
         let small = normalized(img.transformed(by: CGAffineTransform(scaleX: k, y: k)))
         let w = Int(small.extent.width), h = Int(small.extent.height)
@@ -719,7 +724,7 @@ func runSaneLong(_ scanimage: URL) {
 // MARK: - Main
 
 var opts = parseArgs()
-let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw" && !opts.raw)
+let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw" && !opts.raw, greenbar: opts.greenbar)
 
 /// Cleans a page file in place. Returns false when the page is blank.
 func cleanPage(_ url: URL) -> Bool {
