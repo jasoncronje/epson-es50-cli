@@ -12,7 +12,7 @@ trap 'rm -rf "$WORK"' EXIT
 tar -xzf "$TARBALL" -C "$WORK"
 cd "$WORK"/sane-backends-*
 patch -p1 < "$HERE/epsonds-long-paper.patch"
-B=/opt/homebrew
+B="$(brew --prefix)"
 PKG_CONFIG_PATH=$B/lib/pkgconfig CPPFLAGS="-I$B/include" LDFLAGS="-L$B/lib" \
   ./configure --prefix="$PREFIX" BACKENDS=epsonds --with-usb --without-gphoto2 --without-v4l \
   --without-avahi --without-snmp --disable-locking --disable-dependency-tracking >/dev/null

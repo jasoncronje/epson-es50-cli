@@ -1,5 +1,5 @@
-// scan: a small CLI for USB document scanners via macOS ImageCaptureCore.
-// Built for the Epson ES-50 (sheet-fed), works with any ICA scanner driver.
+// scan: a small macOS CLI for the Epson ES-50 sheet-fed scanner. Scans through a patched
+// SANE epsonds backend (sane/build.sh), falling back to ImageCaptureCore without it.
 
 import AppKit
 import Foundation

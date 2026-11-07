@@ -1,8 +1,24 @@
 # scan
 
-Tiny macOS CLI for the Epson ES-50 (or any scanner with an Image Capture driver).
+Small macOS CLI for the Epson ES-50 sheet-fed scanner: scans to PDF/JPEG/PNG, straightens,
+crops and cleans pages, and scans long documents up to 72" (dot-matrix printouts, contracts).
 
+Tested only on the Epson ES-50. Other Epson scanners that SANE's `epsonds` backend supports
+(ES and DS series) may work, but are untested.
+
+## Requirements
+
+- macOS 12 or later (Vision document detection); tested on macOS 27
+- Xcode command-line tools (`xcode-select --install`) for `swiftc`
+- Homebrew, used by `sane/build.sh` for libusb, jpeg-turbo and SANE's source
+
+## Setup
+
+    sane/build.sh         # builds the patched SANE driver into ~/.local/share/scan/sane
     make install          # builds and installs to ~/.local/bin/scan
+
+## Usage
+
     scan info             # show scanner capabilities
     scan                  # one page -> ./scan-<time>.pdf in the current folder
     scan -b bills.pdf     # feed page 1 first, face up, top edge first; Enter when done
@@ -35,4 +51,16 @@ needed: `sudo sh sane/remove-epson.sh` lists Epson's scanner software and
 `--yes` removes it. Without the build, scan falls back to Image Capture, which
 needs Epson's ICA driver and stops at 14".
 
-Run `scan --help` for all options. Setup: `make install` and `sane/build.sh`.
+Run `scan --help` for all options.
+
+## Removing Epson's software (optional)
+
+`sane/remove-epson.sh` deletes Epson Scan 2, its Image Capture driver, ScanSmart, Event
+Manager and related files with sudo. It is written for the ES-50 (driver `ES017E`); check the
+list before removing anything. Run it without `--yes` first: it only prints what it would
+remove. After removal, scan only works through the patched SANE build.
+
+## License
+
+MIT, except `sane/epsonds-long-paper.patch`, which is GPL-2.0-or-later like the SANE code it
+changes. See `LICENSE`.
