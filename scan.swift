@@ -344,6 +344,7 @@ struct PageProcessor {
     let verbose: Bool
     let cleanUp: Bool           // false for 1-bit scans
     var greenbar = false        // printout stripe removal instead of the normal clean-up
+    var binarize = false        // --mode bw: threshold to pure black and white at the end
 
     enum Result { case page(CIImage), blank }
 
@@ -358,6 +359,7 @@ struct PageProcessor {
         }
         img = deskew(img)
         if cleanUp { img = enhance(img) }
+        if binarize { img = img.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.6]) }
         if lineCount == 0 && isBlank(img) { return .blank }
         return .page(img)
     }
@@ -472,7 +474,8 @@ struct PageProcessor {
     /// Long printouts: trims what was scanned past the paper's end, then cuts pages every
     /// `pageInches`, nudging each cut to the emptiest band nearby (the gap at the perforation).
     func splitLong(_ input: CIImage, dpi: Int, pageInches: Double, split: Bool) -> [CIImage] {
-        let img = !cleanUp ? input : greenbar ? cleanPrintout(input) : enhance(input)
+        var img = !cleanUp ? input : greenbar ? cleanPrintout(input) : enhance(input)
+        if binarize { img = img.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.6]) }
         let k = min(1, 600 / img.extent.width)
         let small = normalized(img.transformed(by: CGAffineTransform(scaleX: k, y: k)))
         let w = Int(small.extent.width), h = Int(small.extent.height)
@@ -607,11 +610,12 @@ func writeOutput(pages: [URL], to url: URL, format: String, dpi: Int) throws -> 
     return written
 }
 
-// MARK: - Long paper via patched SANE
+// MARK: - Scanning via patched SANE
 
 // The ES-50 takes paper up to 72" (its AMAX), but Image Capture and stock SANE stop at 14".
 // sane/build.sh builds SANE's epsonds backend with a patch that, when EPSONDS_LONG_PAPER is
-// set, allows the full length. When that build exists, --long scans through it.
+// set, allows the full length. When that build exists, all scans go through it, so no Epson
+// software is needed; otherwise scan falls back to Image Capture (Epson's ICA driver).
 let saneRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share/scan/sane")
 let saneScanimage: URL? = {
     let u = saneRoot.appendingPathComponent("bin/scanimage")
@@ -648,9 +652,7 @@ func loadPNM(_ url: URL) -> CIImage? {
     return CIImage(cgImage: cg)
 }
 
-func runSaneLong(_ scanimage: URL) {
-    guard [200, 300, 400, 600].contains(opts.dpi) else { die("long scans support 200, 300, 400 or 600 dpi") }
-    // Find the scanner.
+func findSaneDevice(_ scanimage: URL) -> String {
     let find = Process()
     find.executableURL = scanimage
     find.arguments = ["-f", "%d%n"]
@@ -662,18 +664,60 @@ func runSaneLong(_ scanimage: URL) {
     find.waitUntilExit()
     let devices = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     guard let device = devices.split(separator: "\n").first(where: { $0.hasPrefix("epsonds:") }).map(String.init) else {
-        die("no scanner found for long scans. Is it plugged in, and not in use by another app?")
+        die("no scanner found. Is it plugged in, and not in use by another app?")
     }
-    scanner.v("long scan via SANE on \(device)")
-    log("""
-    long printout: feed top edge first, face up, up to 72" per stretch
-      guide the paper in and out by hand\(opts.batch ? "\n  after each stretch, feed the next one or press Enter to finish" : "")
-    """)
+    return device
+}
+
+/// `scan info` through SANE.
+func saneInfo(_ scanimage: URL) -> Never {
+    let device = findSaneDevice(scanimage)
+    print("device:      \(device)")
+    print("source:      sheet feeder (front side only)")
+    print("resolutions: 200, 300, 400, 600 dpi")
+    print("modes:       color, gray, bw")
+    print("max size:    8.5 x 14 in, or 8.5 x 72 in with --long")
+    exit(0)
+}
+
+/// Page width and height in mm for --size (the ES-50 feeder is left aligned).
+func saneArea(_ size: String) -> (Double, Double) {
+    switch size {
+    case "a4": return (210, 297)
+    case "legal": return (215.9, 355.6)
+    case "a5": return (148, 210)
+    case "b5": return (176, 250)
+    default: return (215.9, 279.4)             // letter
+    }
+}
+
+/// Scans through the patched SANE build: normal pages, or long paper with --long.
+func runSane(_ scanimage: URL) {
+    guard [200, 300, 400, 600].contains(opts.dpi) else { die("the scanner supports 200, 300, 400 or 600 dpi") }
+    if opts.duplex { log("note: the ES-50 scans one side only; --duplex ignored") }
+    let device = findSaneDevice(scanimage)
+    scanner.v("scanning via SANE on \(device)")
+    let (w, h) = opts.long ? (215.9, 1828.8) : saneArea(opts.size)
+    if opts.long {
+        log("""
+        long document: feed top edge first, face up, up to 72" at a time
+          guide the paper in and out by hand\(opts.batch ? "\n  after each piece, feed the next one or press Enter to finish" : "")
+        """)
+    } else if opts.batch {
+        log("""
+        batch scan: feed page 1 first, then 2, 3… (saved in the order fed)
+          face up, top edge first, against the left side of the slot
+          press Enter after the last page
+        """)
+    }
 
     var n = 0
     func finish() -> Never {
         let count = scanner.pages.count
-        if count == 0 { if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }; die("nothing scanned") }
+        if count == 0 {
+            if scanner.stopRequested { log("cancelled, nothing scanned"); exit(130) }
+            die(n > 0 ? "every page was blank, nothing saved" : "nothing scanned")
+        }
         log("saving \(count) page\(count == 1 ? "" : "s")…")
         do {
             let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
@@ -683,16 +727,21 @@ func runSaneLong(_ scanimage: URL) {
             exit(0)
         } catch { die(error.localizedDescription) }
     }
-    func stretch() {
+    func prompt() -> String {
+        if opts.long { return n == 0 ? "insert the document, top edge first…" : "insert the next piece, or press Enter to finish…" }
+        if !opts.batch { return "insert the sheet face up, top edge first…" }
+        return n == 0 ? "insert page 1…" : "insert page \(n + 1), or press Enter to finish…"
+    }
+    func sheet() {
         let deadline = Date().addingTimeInterval(opts.waitSeconds)
         var announced = false
-        let pnm = scanner.tmpDir.appendingPathComponent("strip-\(n + 1).pnm")
+        let pnm = scanner.tmpDir.appendingPathComponent("sheet-\(n + 1).pnm")
         func attempt() {
             if scanner.stopRequested { finish() }
             let p = Process()
             p.executableURL = scanimage
             p.arguments = ["-d", device, "--source", "ADF Front", "--mode", opts.mode == "color" ? "Color" : "Gray",
-                           "--resolution", String(opts.dpi), "-x", "215.9", "-y", "1828.8", "--format=pnm", "-o", pnm.path]
+                           "--resolution", String(opts.dpi), "-x", String(w), "-y", String(h), "--format=pnm", "-o", pnm.path]
             p.environment = saneEnv()
             let err = Pipe()
             p.standardError = err
@@ -702,42 +751,52 @@ func runSaneLong(_ scanimage: URL) {
                     let size = (try? FileManager.default.attributesOfItem(atPath: pnm.path)[.size] as? Int) ?? 0
                     if proc.terminationStatus == 0, size > 0, let img = loadPNM(pnm) {
                         n += 1
-                        let jpg = pnm.deletingPathExtension().appendingPathExtension(opts.format == "png" ? "png" : "jpg")
-                        do { try processor.write(img, to: jpg, png: opts.format == "png") } catch { die(error.localizedDescription) }
+                        let file = pnm.deletingPathExtension().appendingPathExtension(opts.format == "png" ? "png" : "jpg")
+                        do { try processor.write(img, to: file, png: opts.format == "png") } catch { die(error.localizedDescription) }
                         try? FileManager.default.removeItem(at: pnm)
-                        let parts = splitLongPage(jpg)
-                        scanner.pages += parts
-                        log(String(format: "stretch %d done: %.1f\" scanned, %d page%@, %d so far", n,
-                                   img.extent.height / CGFloat(opts.dpi), parts.count, parts.count == 1 ? "" : "s", scanner.pages.count))
-                        if opts.batch && !scanner.stopRequested { stretch() } else { finish() }
+                        if opts.long {
+                            let parts = splitLongPage(file)
+                            scanner.pages += parts
+                            log(String(format: "piece %d done: %.1f\" long, %d page%@, %d so far", n,
+                                       img.extent.height / CGFloat(opts.dpi), parts.count, parts.count == 1 ? "" : "s", scanner.pages.count))
+                        } else if !opts.raw && !cleanPage(file) && !opts.keepBlank {
+                            try? FileManager.default.removeItem(at: file)
+                            log("page \(n) is blank, skipped")
+                        } else {
+                            scanner.pages.append(file)
+                            log("page \(n) done")
+                        }
+                        if opts.batch && !scanner.stopRequested { sheet() } else { finish() }
                     } else if proc.terminationStatus == 7 {      // SANE_STATUS_NO_DOCS: no paper yet
                         if Date() < deadline && !scanner.stopRequested {
-                            let prompt = n == 0 ? "insert the printout, top edge first…" : "insert the next stretch, or press Enter to finish…"
-                            if !announced { log(prompt); announced = true }
+                            if !announced { log(prompt()); announced = true }
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: attempt)
                         } else if n == 0 && !scanner.stopRequested {
-                            die("no paper detected within \(Int(opts.waitSeconds))s")
+                            die("no sheet detected within \(Int(opts.waitSeconds))s")
                         } else { finish() }
                     } else {
                         let detail = msg.split(separator: "\n").last.map(String.init) ?? "exit \(proc.terminationStatus)"
-                        if scanner.pages.isEmpty { die("long scan failed: \(detail)") }
-                        log("long scan failed: \(detail); saving the pages scanned before it")
+                        if scanner.pages.isEmpty { die("scan failed: \(detail)") }
+                        log("scan failed: \(detail); saving the pages scanned before it")
                         finish()
                     }
                 }
             }
-            scanner.v("requesting long scan")
+            scanner.v("requesting scan")
             do { try p.run() } catch { die(error.localizedDescription) }
         }
         attempt()
     }
-    stretch()
+    sheet()
 }
 
 // MARK: - Main
 
 var opts = parseArgs()
-let processor = PageProcessor(verbose: opts.verbose, cleanUp: opts.mode != "bw" && !opts.raw, greenbar: opts.greenbar)
+// Through SANE, bw scans arrive as gray and are cleaned, then thresholded; Image Capture
+// delivers 1-bit scans that skip the clean-up.
+let processor = PageProcessor(verbose: opts.verbose, cleanUp: !opts.raw && (opts.mode != "bw" || saneScanimage != nil),
+                              greenbar: opts.greenbar, binarize: opts.mode == "bw" && saneScanimage != nil && !opts.raw)
 
 /// Cleans a page file in place. Returns false when the page is blank.
 func cleanPage(_ url: URL) -> Bool {
@@ -855,8 +914,9 @@ if opts.batch && isatty(STDIN_FILENO) != 0 {
     }
 }
 
-if opts.long, opts.command == "scan", let sane = saneScanimage {
-    runSaneLong(sane)
+if let sane = saneScanimage, opts.command == "scan" || opts.command == "info" {
+    if opts.command == "info" { saneInfo(sane) }
+    runSane(sane)
 } else {
 if opts.long && opts.command == "scan" {
     log("note: long scans stop at 14\" without the patched SANE build; run sane/build.sh for up to 72\"")

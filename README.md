@@ -23,7 +23,9 @@ but also fades blue or coloured ink, so use it only on greenbar paper.
 The ES-50 takes paper up to 72", but Image Capture and stock SANE stop at 14".
 `sane/build.sh` builds SANE's epsonds backend with `sane/epsonds-long-paper.patch`
 (it lets the scan area use the scanner's reported maximum, `#ADF AMAX`) into
-`~/.local/share/scan/sane`. When that build exists, `scan -l` scans through it;
-otherwise long scans stop at 14".
+`~/.local/share/scan/sane`. When that build exists, all scans go through it and no Epson software is
+needed: `sudo sh sane/remove-epson.sh` lists Epson's scanner software and
+`--yes` removes it. Without the build, scan falls back to Image Capture, which
+needs Epson's ICA driver and stops at 14".
 
-Run `scan --help` for all options. Needs Epson's ICA driver (installed with Epson Scan 2 / Software Updater).
+Run `scan --help` for all options. Setup: `make install` and `sane/build.sh`.
