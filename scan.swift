@@ -14,7 +14,7 @@ struct Options {
     var dpi = 300
     var mode = "color"          // color | gray | bw
     var format: String?         // pdf | jpg | png (default: from output extension, else pdf)
-    var size = "a4"             // a4 | letter | legal | a5 | b5 | default
+    var size = "letter"           // a4 | letter | legal | a5 | b5 | default
     var duplex = false
     var batch = false           // keep scanning sheets into one file
     var waitSeconds = 30.0      // how long to wait for a sheet
@@ -34,7 +34,7 @@ options:
   -r, --dpi N         resolution (default 300)
   -m, --mode MODE     color | gray | bw (default color)
   -f, --format FMT    pdf | jpg | png (default: output extension, else pdf)
-  -s, --size SIZE     a4 | letter | legal | a5 | b5 | default (default a4)
+  -s, --size SIZE     a4 | letter | legal | a5 | b5 | default (default letter)
   -b, --batch         keep scanning sheets into one PDF until no new sheet arrives
   -w, --wait SECS     how long to wait for each sheet (default 30)
   -d, --duplex        scan both sides, if supported
@@ -159,11 +159,18 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
     func device(_ d: ICDevice, didCloseSessionWithError e: (any Error)?) {}
     func deviceDidBecomeReady(_ d: ICDevice) {
         guard let s = d as? ICScannerDevice else { return }
-        v("ready")
+        v("ready, selecting \(s.selectedFunctionalUnit.type.rawValue)")
+        // Drivers often need an explicit select before they accept settings and scans.
+        s.requestSelect(s.selectedFunctionalUnit.type)
+    }
+    func scannerDevice(_ s: ICScannerDevice, didSelect fu: ICScannerFunctionalUnit, error e: (any Error)?) {
+        let cur = s.selectedFunctionalUnit
+        v("selected unit \(fu.type.rawValue) (device has \(cur.type.rawValue), \(cur.supportedResolutions.count) resolutions)\(e.map { " error: \($0.localizedDescription)" } ?? "")")
+        guard !cur.supportedResolutions.isEmpty else { return }
         onReady?(s); onReady = nil
     }
     func device(_ d: ICDevice, didReceiveStatusInformation status: [ICDeviceStatus: Any]) {
-        v("status \(status)")
+        if !status.isEmpty { v("status \(status)") }
     }
 
     // Scanner
@@ -201,11 +208,10 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
             if opts.duplex {
                 if f.supportsDuplexScanning { f.duplexScanningEnabled = true } else { log("note: duplex not supported") }
             }
-        } else {
-            // Flatbed: scan the requested page area.
-            let (w, h) = pageInches(opts.size)
-            fu.scanArea = NSRect(x: 0, y: 0, width: w, height: h)
         }
+        let (w, h) = pageInches(opts.size)
+        fu.scanArea = NSRect(x: 0, y: 0, width: w, height: h)
+        v("dpi \(fu.resolution) area \(fu.scanArea) docType \((fu as? ICScannerFunctionalUnitDocumentFeeder)?.documentType.rawValue ?? 0)")
         s.transferMode = .fileBased
         s.downloadsDirectory = tmpDir
         s.documentUTI = opts.format == "png" ? "public.png" : "public.jpeg"
@@ -234,30 +240,21 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
 
     // MARK: Scan loop
 
-    func paperLoaded(_ s: ICScannerDevice) -> Bool? {
-        (s.selectedFunctionalUnit as? ICScannerFunctionalUnitDocumentFeeder)?.documentLoaded
-    }
-
-    /// Waits for a sheet (feeder only), then scans it. Calls back with whether a page was scanned.
+    /// Waits for a sheet, then scans it. Calls back with whether a page was scanned.
+    /// The feeder's documentLoaded flag only refreshes per session, so instead keep
+    /// requesting scans: with no paper the ES-50 driver completes at once with no page.
     func scanOne(_ s: ICScannerDevice, prompt: String, completion: @escaping (Bool) -> Void) {
         let deadline = Date().addingTimeInterval(opts.waitSeconds)
         var announced = false
         func attempt() {
-            if let loaded = paperLoaded(s), !loaded {
-                if Date() > deadline { completion(false); return }
-                if !announced { log(prompt); announced = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: attempt)
-                return
-            }
             let before = pages.count
-            log("scanning…")
+            v("requesting scan")
             scanDone = { [weak self] err in
                 guard let self else { return }
                 let got = self.pages.count > before
                 if got {
                     completion(true)
                 } else if Date() < deadline {
-                    // Driver may not report paper state; retry until the wait runs out.
                     if !announced { log(prompt); announced = true }
                     if let err { self.v("no page yet: \(err.localizedDescription)") }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: attempt)
@@ -273,11 +270,15 @@ final class Scanner: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate 
 
 // MARK: - Output
 
-func writeOutput(pages: [URL], to url: URL, format: String) throws -> [URL] {
+func writeOutput(pages: [URL], to url: URL, format: String, dpi: Int) throws -> [URL] {
     if format == "pdf" {
         let doc = PDFDocument()
         for (i, p) in pages.enumerated() {
-            guard let img = NSImage(contentsOf: p), let page = PDFPage(image: img) else { continue }
+            guard let img = NSImage(contentsOf: p), let rep = img.representations.first else { continue }
+            // Size the page in points from the scan dpi, not 1 pt per pixel.
+            img.size = NSSize(width: CGFloat(rep.pixelsWide) * 72 / CGFloat(dpi),
+                              height: CGFloat(rep.pixelsHigh) * 72 / CGFloat(dpi))
+            guard let page = PDFPage(image: img) else { continue }
             doc.insert(page, at: i)
         }
         guard doc.write(to: url) else { throw NSError(domain: "scan", code: 1, userInfo: [NSLocalizedDescriptionKey: "could not write \(url.path)"]) }
@@ -333,7 +334,7 @@ scanner.start { dev in
                 die("no sheet detected within \(Int(opts.waitSeconds))s")
             }
             do {
-                let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!)
+                let files = try writeOutput(pages: scanner.pages, to: outURL, format: opts.format!, dpi: opts.dpi)
                 try? FileManager.default.removeItem(at: scanner.tmpDir)
                 for f in files { print(f.path) }
                 if opts.open { NSWorkspace.shared.open(files[0]) }
