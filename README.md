@@ -20,4 +20,10 @@ unused tail is trimmed, pages are cut at the gap nearest every `--page-length`
 (default 11"), and greenbar/bluebar stripes are removed. `--no-split` keeps one
 tall page.
 
+The ES-50 takes paper up to 72", but Image Capture and stock SANE stop at 14".
+`sane/build.sh` builds SANE's epsonds backend with `sane/epsonds-long-paper.patch`
+(it lets the scan area use the scanner's reported maximum, `#ADF AMAX`) into
+`~/.local/share/scan/sane`. When that build exists, `scan -l` scans through it;
+otherwise long scans stop at 14".
+
 Run `scan --help` for all options. Needs Epson's ICA driver (installed with Epson Scan 2 / Software Updater).

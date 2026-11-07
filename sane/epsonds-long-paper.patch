@@ -1,0 +1,30 @@
+--- a/backend/epsonds-cmd.c	2025-05-24 13:03:03
++++ b/backend/epsonds-cmd.c	2026-11-07 10:17:06
+@@ -15,6 +15,7 @@
+ 
+ #include "sane/config.h"
+ #include <ctype.h>
++#include <stdlib.h>
+ #include <unistd.h>	     /* sleep */
+ 
+ #include "epsonds.h"
+@@ -465,6 +466,9 @@
+ 				int max = decode_value(value + 4 + 8, 8);
+ 
+ 				DBG(1, "     ADF: max %dx%d @ 100dpi\n", min, max);
++				/* long paper: AMAX is the longest document the feeder takes (72" on the ES-50) */
++				if (getenv("EPSONDS_LONG_PAPER"))
++					eds_set_adf_area(s->hw, min, max, 100);
+ 			}
+ 		}
+ 
+@@ -493,6 +497,9 @@
+ 				int max = decode_value(value + 4 + 4, 8);
+ 
+ 				DBG(1, "     ADF: max %dx%d @ 100dpi\n", min, max);
++				/* long paper: AMAX is the longest document the feeder takes (72" on the ES-50) */
++				if (getenv("EPSONDS_LONG_PAPER"))
++					eds_set_adf_area(s->hw, min, max, 100);
+ 			}
+ 		}
+ 
