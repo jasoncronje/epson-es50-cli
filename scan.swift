@@ -357,13 +357,13 @@ struct PageProcessor {
     func v(_ s: String) { if verbose { log("· " + s) } }
 
     func process(_ input: CIImage) -> Result {
-        var img = cropToSheet(input)
+        var img = cropToSheet(trimBackground(input))
         let (lineCount, flipped) = readOrientation(img)
         if flipped {
             v("page is upside down, rotating")
             img = normalized(img.oriented(.down))
         }
-        img = deskew(img)
+        img = whitenEdgeBackground(deskew(img))
         if cleanUp { img = enhance(img) }
         if binarize { img = img.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.6]) }
         if lineCount == 0 && isBlank(img) { return .blank }
@@ -372,6 +372,118 @@ struct PageProcessor {
 
     func normalized(_ img: CIImage) -> CIImage {
         img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+    }
+
+    /// Renders a small grey copy for pixel analysis; rows run top to bottom.
+    func grayBitmap(_ img: CIImage, width: CGFloat) -> (px: [UInt8], w: Int, h: Int, k: CGFloat) {
+        let k = min(1, width / img.extent.width)
+        let small = normalized(img.transformed(by: CGAffineTransform(scaleX: k, y: k)))
+        let w = Int(small.extent.width), h = Int(small.extent.height)
+        var px = [UInt8](repeating: 0, count: max(0, w * h))
+        if w > 0 && h > 0 {
+            context.render(small, toBitmap: &px, rowBytes: w, bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                           format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
+        }
+        return (px, w, h, k)
+    }
+
+    /// Cuts away the scanner around a sheet smaller than the scan area: the dark backing beside
+    /// a narrow sheet, and the dark gap plus blank padding the scanner adds after a short sheet
+    /// ends. Left in, they hide the sheet's outline from Vision and confuse the deskew.
+    func trimBackground(_ img: CIImage) -> CIImage {
+        let (px, w, h, k) = grayBitmap(img, width: 800)
+        guard w > 50, h > 50 else { return img }
+        let dark: UInt8 = 90
+        func rowDark(_ y: Int) -> Double {
+            var n = 0
+            for x in 0..<w where px[y * w + x] < dark { n += 1 }
+            return Double(n) / Double(w)
+        }
+        var top = 0, bottom = h
+        while top < h / 4 && rowDark(top) > 0.6 { top += 1 }
+        // A short sheet ends where padding starts, with scanner background (the dark gap
+        // after the sheet, or the backing beside a narrow one) just above it. A full page with a
+        // blank lower half has paper there instead, so it is left alone.
+        func blank(_ y: Int) -> Bool {
+            var n = 0
+            for x in 0..<w where px[y * w + x] >= dark && px[y * w + x] < 235 { n += 1 }
+            return n <= w / 200     // only white padding or dark backing, no paper
+        }
+        func background(_ y: Int) -> Bool {
+            var l = 0, r = 0
+            while l < w && px[y * w + l] < dark { l += 1 }
+            while r < w - l && px[y * w + w - 1 - r] < dark { r += 1 }
+            return l + r >= w * 3 / 100 || rowDark(y) > 0.6
+        }
+        var blankFrom = h
+        while blankFrom > h - h / 100 && !blank(blankFrom - 1) { blankFrom -= 1 }   // stray edge rows
+        // Allow a few grey rows where the sheet's tail meets the backing.
+        var y = blankFrom, gap = 0
+        while y > top + h / 10 && gap <= 3 {
+            if blank(y - 1) { blankFrom = y - 1; gap = 0 } else { gap += 1 }
+            y -= 1
+        }
+        if blankFrom < h - h / 20, (max(top, blankFrom - 6)..<blankFrom).contains(where: background) {
+            bottom = blankFrom
+            while bottom > top + h / 10 && rowDark(bottom - 1) > 0.6 { bottom -= 1 }
+        }
+        func colDark(_ x: Int) -> Double {
+            var n = 0
+            for y in top..<bottom where px[y * w + x] < dark { n += 1 }
+            return Double(n) / Double(bottom - top)
+        }
+        var left = 0, right = w
+        while left < w / 4 && colDark(left) > 0.6 { left += 1 }
+        while right > w * 3 / 4 && colDark(right - 1) > 0.6 { right -= 1 }
+        guard top > h / 100 || bottom < h - h / 100 || left > w / 100 || right < w - w / 100 else { return img }
+        let e = img.extent
+        let rect = CGRect(x: e.minX + CGFloat(left) / k, y: e.minY + CGFloat(h - bottom) / k,
+                          width: CGFloat(right - left) / k, height: CGFloat(bottom - top) / k).intersection(e)
+        v(String(format: "trimmed scanner background to %.1f x %.1f in of %.1f x %.1f",
+                 rect.width / e.width * 8.5, rect.height / e.width * 8.5, 8.5, e.height / e.width * 8.5))
+        return normalized(img.cropped(to: rect))
+    }
+
+    /// Paints white any scanner background still showing along the edges, such as the dark
+    /// wedges beside a sheet that went through at an angle.
+    func whitenEdgeBackground(_ img: CIImage) -> CIImage {
+        let (px, w, h, k) = grayBitmap(img, width: 800)
+        guard w > 50, h > 50 else { return img }
+        let reach = max(3, min(w, h) * 6 / 100)     // only near the edges, never into the page
+        var mask = [UInt8](repeating: 0, count: w * h), queue: [Int] = []
+        func near(_ i: Int) -> Bool { let x = i % w, y = i / w; return min(x, y, w - 1 - x, h - 1 - y) < reach }
+        func push(_ i: Int) { if mask[i] == 0 && px[i] < 90 && near(i) { mask[i] = 255; queue.append(i) } }
+        for x in 0..<w { push(x); push((h - 1) * w + x) }
+        for y in 0..<h { push(y * w); push(y * w + w - 1) }
+        var head = 0
+        while head < queue.count {
+            let i = queue[head]; head += 1
+            let x = i % w
+            if x > 0 { push(i - 1) }
+            if x < w - 1 { push(i + 1) }
+            if i >= w { push(i - w) }
+            if i < (h - 1) * w { push(i + w) }
+        }
+        guard queue.count > w / 2 else { return img }
+        v("whitening scanner background at the edges")
+        // Grow the mask a pixel so the soft edge of the background goes too.
+        var grown = mask
+        for i in queue {
+            let x = i % w
+            for j in [i - 1, i + 1, i - w, i + w] where j >= 0 && j < w * h && abs(j % w - x) <= 1 { grown[j] = 255 }
+        }
+        let data = Data(grown)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+                               space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: 0),
+                               provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return img }
+        let m = CIImage(cgImage: cg)
+            .transformed(by: CGAffineTransform(scaleX: img.extent.width / CGFloat(w), y: img.extent.height / CGFloat(h)))
+            .transformed(by: CGAffineTransform(translationX: img.extent.minX, y: img.extent.minY))
+        let white = CIImage(color: .white).cropped(to: img.extent)
+        return white.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: img, kCIInputMaskImageKey: m]).cropped(to: img.extent)
     }
 
     /// Finds the sheet's four corners and warps it to a flat rectangle.

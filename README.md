@@ -20,6 +20,9 @@ unused tail is trimmed and it is saved as one tall page. `--split` (or
 `--page-length N`) cuts it into pages at the gap nearest every 11" (or N"). `--greenbar` removes green/blue bar stripes from computer printouts,
 but also fades blue or coloured ink, so use it only on greenbar paper.
 
+Sheets smaller than the scan area (receipts, slips, tear-off forms) are cut out of the scanner
+background, straightened, and any dark backing left along the edges is painted white.
+
 Clean-up sharpens normal pages (SANE returns the sensor image unsharpened). Faint dot-matrix or
 carbon text gets a softer recipe that joins the dots instead: on by default with `--long`, or
 force it with `--faint` / `--no-faint`.
