@@ -5,6 +5,7 @@ command-line tool that drives the Epson ES-50 directly. It's built to be run by 
 scripts as much as by hand.
 
 ![A tilted yellow receipt on dark scanner backing, and the same receipt cropped, straightened and cleaned](docs/before-after.png)
+
 ## What it does
 
 - Scans to PDF, JPEG or PNG
